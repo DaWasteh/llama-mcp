@@ -25,13 +25,16 @@ import io
 import logging
 import os
 import platform
+import re
 import shutil
 import sys
+import tarfile
 import tempfile
 import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 # ============================================================
 # Stderr auf UTF-8 zwingen (Windows-Konsole nutzt sonst cp1252)
@@ -105,6 +108,8 @@ MAX_ZIP_TOTAL_SIZE = 500 * 1024 * 1024  # 500 MB entpacktes Gesamtvolumen
 MAX_ZIP_COMPRESSION_RATIO = 100  # uncompressed/compressed >= 100 => verdaechtig
 MAX_ZIP_FILES = 10_000  # Max. Dateien pro Archiv
 MAX_BINARY_BASE64_SIZE = 50 * 1024 * 1024  # 50 MB nach Decode
+MAX_CONTENT_SEARCH_FILE_SIZE = 5 * 1024 * 1024  # 5 MB: Dateien > werden bei Inhaltssuche übersprungen
+MAX_REPLACE_FILE_SIZE = 10 * 1024 * 1024  # 10 MB: Dateien > werden bei find_replace abgelehnt
 
 
 # ============================================================
@@ -397,6 +402,87 @@ def write_file_binary(path: str, content: str, encoding: str = "base64") -> dict
         return {"error": f"Unbekanntes Encoding: {encoding}"}
     except Exception as e:
         return {"error": f"Fehler beim Schreiben: {e!s}"}
+
+
+@mcp.tool()
+def find_replace(
+    path: str,
+    pattern: str,
+    replacement: str,
+    use_regex: bool = False,
+    case_sensitive: bool = False,
+    count: int = 0,
+    backup: bool = False,
+) -> dict:
+    """Sucht und ersetzt Text in einer Datei (literal oder Regex).
+
+    Sicherer und effizienter als read+modify+write, insb. bei grossen Dateien.
+    Ersetzt standardmaessig alle Treffer (count=0); mit count=N genau N Vorkommen.
+
+    Args:
+        path: Datei, die bearbeitet werden soll.
+        pattern: Suchtext (literal) oder Regex (wenn use_regex=True).
+        replacement: Ersatztext (Regex-Gruppen wie \\1 werden unterstuetzt).
+        use_regex: True -> pattern als regulärer Ausdruck interpretieren.
+        case_sensitive: Gross-/Kleinschreibung beachten.
+        count: Max. Ersetzungen (0 = alle).
+        backup: True -> legt vor dem Schreiben eine .bak-Kopie an.
+    """
+    ok, reason = is_path_safe(path, must_exist=True)
+    if not ok:
+        return {"error": f"Zugriff verweigert: {reason}"}
+
+    abs_path = os.path.abspath(path)
+    count = max(0, count)
+
+    try:
+        if os.path.isdir(abs_path):
+            return {"error": f"Keine Datei (Verzeichnis): {path}"}
+        if os.path.getsize(abs_path) > MAX_REPLACE_FILE_SIZE:
+            return {"error": f"Datei zu gross fuer find_replace: {os.path.getsize(abs_path)} (Limit: {MAX_REPLACE_FILE_SIZE})"}
+
+        with open(abs_path, encoding="utf-8") as f:
+            original = f.read()
+
+        if use_regex:
+            try:
+                regex = re.compile(pattern, 0 if case_sensitive else re.IGNORECASE)
+            except re.error as e:
+                return {"error": f"Ungueltiges Regex-Muster: {e}"}
+            new_text, n = regex.subn(replacement, original, count=count or 0)
+        else:
+            if case_sensitive:
+                n = original.count(pattern)
+                new_text = original.replace(pattern, replacement, count) if count else original.replace(pattern, replacement)
+                n = min(n, count) if count else n
+            else:
+                regex = re.compile(re.escape(pattern), re.IGNORECASE)
+                new_text, n = regex.subn(lambda m: replacement, original, count=count or 0)
+
+        if new_text == original:
+            return {"success": True, "path": path, "replacements": 0, "note": "Keine Treffer"}
+
+        if backup:
+            shutil.copy2(abs_path, abs_path + ".bak")
+
+        with open(abs_path, "w", encoding="utf-8") as f:
+            f.write(new_text)
+
+        return {
+            "success": True,
+            "path": path,
+            "replacements": n,
+            "backup_created": backup,
+            "new_size_bytes": len(new_text.encode("utf-8")),
+        }
+    except UnicodeDecodeError:
+        return {"error": f"Binaerdatei / nicht UTF-8: {path}"}
+    except FileNotFoundError:
+        return {"error": f"Datei nicht gefunden: {path}"}
+    except PermissionError:
+        return {"error": f"Keine Berechtigung: {path}"}
+    except Exception as e:
+        return {"error": f"Fehler: {e!s}"}
 
 
 # ============================================================
@@ -947,12 +1033,16 @@ def rename_file(path: str, new_name: str) -> dict:
 
 @mcp.tool()
 def compress_archive(path: str, archive_path: str, compression: str = "DEFLATED") -> dict:
-    """Komprimiert eine Datei oder ein Verzeichnis als ZIP-Archiv.
+    """Komprimiert eine Datei oder ein Verzeichnis als Archiv.
+
+    Unterstuetzt ZIP (.zip) und Tarball (.tar, .tar.gz/.tgz, .tar.bz2/.tbz2,
+    .tar.xz/.txz). Das Format wird anhand der Endung von archive_path erkannt.
+    Der compression-Parameter ("STORED"/"DEFLATED") gilt nur fuer ZIP.
 
     Args:
         path: Zu komprimierende Datei oder Verzeichnis.
-        archive_path: Pfad fuer das ZIP-Archiv.
-        compression: "STORED" oder "DEFLATED" (Default).
+        archive_path: Pfad fuer das Archiv (Endung bestimmt das Format).
+        compression: Nur ZIP: "STORED" oder "DEFLATED" (Default).
     """
     ok_s, reason_s = is_path_safe(path, must_exist=True)
     if not ok_s:
@@ -963,36 +1053,95 @@ def compress_archive(path: str, archive_path: str, compression: str = "DEFLATED"
 
     abs_path = os.path.abspath(path)
     abs_archive = os.path.abspath(archive_path)
+    fmt = _detect_archive_format(abs_archive)
 
     try:
-        compress_type = zipfile.ZIP_DEFLATED if compression == "DEFLATED" else zipfile.ZIP_STORED
-        file_count = 0
-
-        with zipfile.ZipFile(abs_archive, "w", compression=compress_type) as zipf:
-            if os.path.isdir(abs_path):
-                for root, _dirs, files in os.walk(abs_path, followlinks=False):
-                    for file in files:
-                        if file_count >= MAX_ZIP_FILES:
-                            return {"error": f"Zu viele Dateien (Limit: {MAX_ZIP_FILES})"}
-                        file_path = os.path.join(root, file)
-                        arcname = os.path.relpath(file_path, os.path.dirname(abs_path))
-                        zipf.write(file_path, arcname)
-                        file_count += 1
-            else:
-                arcname = os.path.basename(abs_path)
-                zipf.write(abs_path, arcname)
-                file_count = 1
+        if fmt == "tar":
+            file_count, archive_format = _compress_tar(abs_path, abs_archive)
+        else:
+            file_count = _compress_zip(abs_path, abs_archive, compression)
+            archive_format = "zip"
 
         return {
             "success": True,
             "source": path,
             "archive": archive_path,
             "archive_size": os.path.getsize(abs_archive),
-            "compression": compression,
+            "format": archive_format,
             "file_count": file_count,
         }
+    except _ArchiveLimitError as e:
+        return {"error": str(e)}
     except Exception as e:
         return {"error": f"Komprimierungsfehler: {e!s}"}
+
+
+class _ArchiveLimitError(Exception):
+    """Signalisiert ein überschrittenes Sicherheitslimit beim Archivieren."""
+
+
+_TAR_EXTS = (".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tbz", ".tar.xz", ".txz", ".tar")
+
+
+def _detect_archive_format(archive_path: str) -> str:
+    """Erkennt das Archivformat anhand der Endung ('tar' oder 'zip')."""
+    lower = archive_path.lower()
+    if lower.endswith(_TAR_EXTS):
+        return "tar"
+    return "zip"
+
+
+def _compress_zip(abs_path: str, abs_archive: str, compression: str) -> int:
+    """Komprimiert nach ZIP. Gibt die Anzahl Dateien zurueck."""
+    compress_type = zipfile.ZIP_DEFLATED if compression == "DEFLATED" else zipfile.ZIP_STORED
+    file_count = 0
+    with zipfile.ZipFile(abs_archive, "w", compression=compress_type) as zipf:
+        if os.path.isdir(abs_path):
+            for root, _dirs, files in os.walk(abs_path, followlinks=False):
+                for file in files:
+                    if file_count >= MAX_ZIP_FILES:
+                        raise _ArchiveLimitError(f"Zu viele Dateien (Limit: {MAX_ZIP_FILES})")
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, os.path.dirname(abs_path))
+                    zipf.write(file_path, arcname)
+                    file_count += 1
+        else:
+            zipf.write(abs_path, os.path.basename(abs_path))
+            file_count = 1
+    return file_count
+
+
+def _tar_mode_for_write(archive_path: str) -> Literal["w", "w:gz", "w:bz2", "w:xz"]:
+    """Wahlt den tarfile-Schreibmodus anhand der Endung."""
+    lower = archive_path.lower()
+    if lower.endswith((".tar.gz", ".tgz")):
+        return "w:gz"
+    if lower.endswith((".tar.bz2", ".tbz2", ".tbz")):
+        return "w:bz2"
+    if lower.endswith((".tar.xz", ".txz")):
+        return "w:xz"
+    return "w"
+
+
+def _compress_tar(abs_path: str, abs_archive: str) -> tuple[int, str]:
+    """Komprimiert nach Tarball. Gibt (Anzahl Dateien, Format-String) zurueck."""
+    mode = _tar_mode_for_write(abs_archive)
+    arc_root = os.path.dirname(abs_path)
+    file_count = 0
+    with tarfile.open(abs_archive, mode) as tar:
+        if os.path.isdir(abs_path):
+            for root, _dirs, files in os.walk(abs_path, followlinks=False):
+                for file in files:
+                    if file_count >= MAX_ZIP_FILES:
+                        raise _ArchiveLimitError(f"Zu viele Dateien (Limit: {MAX_ZIP_FILES})")
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, arc_root)
+                    tar.add(file_path, arcname, recursive=False)
+                    file_count += 1
+        else:
+            tar.add(abs_path, os.path.basename(abs_path), recursive=False)
+            file_count = 1
+    return file_count, f"tar({mode})"
 
 
 def _is_safe_zip_member(member: zipfile.ZipInfo, dest_dir: str) -> tuple[bool, str]:
@@ -1027,14 +1176,46 @@ def _is_safe_zip_member(member: zipfile.ZipInfo, dest_dir: str) -> tuple[bool, s
     return True, "OK"
 
 
+def _is_safe_tar_member(member: tarfile.TarInfo, dest_dir: str) -> tuple[bool, str]:
+    """Prueft, ob ein Tarball-Eintrag sicher entpackt werden kann.
+
+    Tarballs koennen neben Dateien/Verzeichnissen auch Symlinks, Hardlinks und
+    Geraetedateien enthalten - all diese werden abgelehnt (Path-Traversal- &
+    Escalation-Schutz). Tar-Slip (../) und absolute Pfade ebenfalls.
+    """
+    name = member.name
+
+    if "\x00" in name:
+        return False, "Null-Byte im Dateinamen"
+    if os.path.isabs(name) or name.startswith("/") or name.startswith("\\"):
+        return False, f"Absoluter Pfad nicht erlaubt: {name}"
+    if len(name) >= 2 and name[1] == ":":
+        return False, f"Drive-Letter nicht erlaubt: {name}"
+
+    target_path = os.path.normpath(os.path.join(dest_dir, name))
+    dest_dir_norm = os.path.normpath(dest_dir) + os.sep
+    if not (target_path + os.sep).startswith(dest_dir_norm) and target_path != os.path.normpath(dest_dir):
+        return False, f"Path-Traversal-Versuch: {name}"
+
+    # Symlinks/Hardlinks koennen auf Ziele ausserhalb von dest_dir zeigen -> ablehnen.
+    # Geraetedateien sind auf einem Mehrbenutzer-/LLM-Tool nicht erwuenscht.
+    if member.issym() or member.islnk():
+        return False, f"Symlink/Hardlink im Archiv nicht erlaubt: {name}"
+    if member.isdev():
+        return False, f"Geraetedatei im Archiv nicht erlaubt: {name}"
+
+    return True, "OK"
+
+
 @mcp.tool()
 def decompress_archive(archive_path: str, destination: str) -> dict:
-    """Entpackt ein ZIP-Archiv in ein Zielverzeichnis.
+    """Entpackt ein Archiv (ZIP oder Tarball) in ein Zielverzeichnis.
 
-    Mit ZIP-Slip-Schutz, ZIP-Bomb-Schutz und Eintragslimit.
+    Unterstuetzt: .zip, .tar, .tar.gz/.tgz, .tar.bz2/.tbz2, .tar.xz/.txz.
+    Mit Path-Traversal- (Slip), Symlink- und Bomb-Schutz (Anzahl, Volumen, Ratio).
 
     Args:
-        archive_path: Pfad zum ZIP-Archiv.
+        archive_path: Pfad zum Archiv.
         destination: Zielverzeichnis.
     """
     ok_a, reason_a = is_path_safe(archive_path, must_exist=True)
@@ -1048,68 +1229,123 @@ def decompress_archive(archive_path: str, destination: str) -> dict:
     abs_dest = os.path.abspath(destination)
 
     try:
-        if not zipfile.is_zipfile(abs_archive):
-            return {"error": f"Keine gueltige ZIP-Datei: {archive_path}"}
+        is_zip = zipfile.is_zipfile(abs_archive)
+        is_tar = not is_zip and tarfile.is_tarfile(abs_archive)
+        if not is_zip and not is_tar:
+            return {"error": f"Kein gueltiges Archiv (ZIP/Tar): {archive_path}"}
 
         os.makedirs(abs_dest, exist_ok=True)
-
         # Auf real existierendes Zielverzeichnis aufloesen (nach makedirs)
         real_dest = os.path.realpath(abs_dest)
         if is_path_blocked(real_dest):
             return {"error": "Zielverzeichnis-Realpath blockiert"}
 
-        extracted: list[str] = []
-        total_size = 0
-        rejected: list[dict] = []
-
-        with zipfile.ZipFile(abs_archive, "r") as zipf:
-            members = zipf.infolist()
-
-            # Pre-Check: Anzahl Dateien
-            if len(members) > MAX_ZIP_FILES:
-                return {"error": f"Zu viele Dateien im Archiv: {len(members)} (Limit: {MAX_ZIP_FILES})"}
-
-            # Pre-Check: Gesamtgroesse (decompression bomb)
-            total_uncompressed = sum(m.file_size for m in members)
-            if total_uncompressed > MAX_ZIP_TOTAL_SIZE:
-                return {"error": f"Entpacktes Volumen zu gross: {total_uncompressed} (Limit: {MAX_ZIP_TOTAL_SIZE})"}
-
-            # Compression-Ratio gegen ZIP-Bombs
-            total_compressed = sum(m.compress_size for m in members) or 1
-            ratio = total_uncompressed / total_compressed
-            if ratio > MAX_ZIP_COMPRESSION_RATIO and total_uncompressed > 10 * 1024 * 1024:
-                logger.warning(f"Verdaechtige Compression-Ratio: {ratio:.1f} ({archive_path})")
-                return {"error": f"Verdaechtige Compression-Ratio ({ratio:.1f}x), Archiv abgelehnt"}
-
-            # Pro-Eintrag Validierung und Extraktion
-            for member in members:
-                safe, why = _is_safe_zip_member(member, real_dest)
-                if not safe:
-                    logger.warning(f"ZIP-Member abgelehnt: {member.filename} - {why}")
-                    rejected.append({"name": member.filename, "reason": why})
-                    continue
-
-                # Sicher entpacken: zipfile.extract() ist auf modernen Pythons
-                # selbst Slip-resistent, aber wir haben zusaetzlich vorgeprueft
-                zipf.extract(member, real_dest)
-                extracted.append(member.filename)
-                total_size += member.file_size
-
-        result = {
-            "success": True,
-            "archive": archive_path,
-            "destination": destination,
-            "extracted_count": len(extracted),
-            "rejected_count": len(rejected),
-            "total_size_bytes": total_size,
-            "files": extracted[:100],  # nicht alles ausgeben
-        }
-        if rejected:
-            result["rejected"] = rejected[:20]
-            result["warning"] = f"{len(rejected)} Eintraege abgelehnt (siehe rejected)"
+        result = _extract_zip(abs_archive, real_dest) if is_zip else _extract_tar(abs_archive, real_dest)
+        result["archive"] = archive_path
+        result["destination"] = destination
         return result
     except Exception as e:
         return {"error": f"Entpackfehler: {e!s}"}
+
+
+def _bomb_precheck(members_sizes: list[int], compressed_size: int) -> str | None:
+    """Gemeinsamer Bomb-Precheck fuer ZIP und Tar. Liefert Fehlergrund oder None."""
+    if len(members_sizes) > MAX_ZIP_FILES:
+        return f"Zu viele Dateien im Archiv: {len(members_sizes)} (Limit: {MAX_ZIP_FILES})"
+    total_uncompressed = sum(members_sizes)
+    if total_uncompressed > MAX_ZIP_TOTAL_SIZE:
+        return (f"Entpacktes Volumen zu gross: {total_uncompressed} "
+                f"(Limit: {MAX_ZIP_TOTAL_SIZE})")
+    total_compressed = compressed_size or 1
+    ratio = total_uncompressed / total_compressed
+    if ratio > MAX_ZIP_COMPRESSION_RATIO and total_uncompressed > 10 * 1024 * 1024:
+        return f"Verdaechtige Compression-Ratio ({ratio:.1f}x), Archiv abgelehnt"
+    return None
+
+
+def _extract_zip(abs_archive: str, real_dest: str) -> dict:
+    """Entpackt ein ZIP-Archiv sicher (Slip/Bomb-Schutz)."""
+    extracted: list[str] = []
+    rejected: list[dict] = []
+    total_size = 0
+
+    with zipfile.ZipFile(abs_archive, "r") as zipf:
+        members = zipf.infolist()
+        err = _bomb_precheck([m.file_size for m in members], sum(m.compress_size for m in members))
+        if err:
+            return {"error": err}
+
+        for member in members:
+            safe, why = _is_safe_zip_member(member, real_dest)
+            if not safe:
+                logger.warning(f"ZIP-Member abgelehnt: {member.filename} - {why}")
+                rejected.append({"name": member.filename, "reason": why})
+                continue
+            zipf.extract(member, real_dest)
+            extracted.append(member.filename)
+            total_size += member.file_size
+
+    return _build_extract_result(extracted, rejected, total_size)
+
+
+def _tar_extract_filter_kwargs() -> dict:
+    """filter='data' ab Python 3.12 (PEP 706) - zusaetzliche Belt-and-Suspenders."""
+    try:
+        import inspect
+        if "filter" in inspect.signature(tarfile.TarFile.extract).parameters:
+            return {"filter": "data"}
+    except (ValueError, TypeError):
+        pass
+    return {}
+
+
+def _extract_tar(abs_archive: str, real_dest: str) -> dict:
+    """Entpackt einen Tarball sicher (Slip/Bomb/Symlink-Schutz).
+
+    Eigenes per-Member-Validieren (versionsunabhaengig, funktioniert auch auf
+    Python < 3.12 ohne filter-Parameter), zusaetzlich filter='data' falls verfuegbar.
+    """
+    extracted: list[str] = []
+    rejected: list[dict] = []
+    total_size = 0
+    extra_kwargs = _tar_extract_filter_kwargs()
+
+    with tarfile.open(abs_archive, "r:*") as tar:
+        members = tar.getmembers()
+        err = _bomb_precheck([m.size for m in members], os.path.getsize(abs_archive))
+        if err:
+            return {"error": err}
+
+        safe_members: list[tarfile.TarInfo] = []
+        for member in members:
+            safe, why = _is_safe_tar_member(member, real_dest)
+            if not safe:
+                logger.warning(f"TAR-Member abgelehnt: {member.name} - {why}")
+                rejected.append({"name": member.name, "reason": why})
+                continue
+            safe_members.append(member)
+            total_size += member.size if member.isfile() else 0
+
+        if safe_members:
+            tar.extractall(path=real_dest, members=safe_members, **extra_kwargs)
+        for m in safe_members:
+            extracted.append(m.name)
+
+    return _build_extract_result(extracted, rejected, total_size)
+
+
+def _build_extract_result(extracted: list[str], rejected: list[dict], total_size: int) -> dict:
+    result: dict = {
+        "success": True,
+        "extracted_count": len(extracted),
+        "rejected_count": len(rejected),
+        "total_size_bytes": total_size,
+        "files": extracted[:100],
+    }
+    if rejected:
+        result["rejected"] = rejected[:20]
+        result["warning"] = f"{len(rejected)} Eintraege abgelehnt (siehe rejected)"
+    return result
 
 
 # ============================================================
@@ -1230,6 +1466,108 @@ def get_recent_files(path: str, max_results: int = 20, time_range_days: int = 7)
             "results": recent,
             "count": len(recent),
             "files_scanned": scanned,
+        }
+    except Exception as e:
+        return {"error": f"Fehler: {e!s}"}
+
+
+@mcp.tool()
+def search_content(
+    path: str,
+    pattern: str,
+    file_pattern: str = "*",
+    max_results: int = 50,
+    case_sensitive: bool = False,
+    context_lines: int = 0,
+) -> dict:
+    """Durchsucht Dateiinhalte nach einem Regex-Muster (grep-aehnlich, rekursiv).
+
+    Im Gegensatz zu search_files (nur Dateinamen) sucht dieses Tool IN den Dateien.
+    Nur Textdateien werden gelesen; Binaerdateien und Dateien > 5 MB werden uebersprungen.
+
+    Args:
+        path: Startverzeichnis.
+        pattern: Regex-Suchmuster (z.B. 'passwort' oder r'\\d{4}-\\d{2}-\\d{2}').
+        file_pattern: Glob-Filter fuer Dateinamen (z.B. '*.py'). Default: alle.
+        max_results: Max. Treffer (1-200).
+        case_sensitive: Gross-/Kleinschreibung beachten.
+        context_lines: Anzahl Kontextzeilen vor/nach jedem Treffer (0-5).
+    """
+    ok, reason = is_path_safe(path, must_exist=True)
+    if not ok:
+        return {"error": f"Zugriff verweigert: {reason}"}
+
+    abs_path = os.path.abspath(path)
+    max_results = max(1, min(max_results, 200))
+    context_lines = max(0, min(context_lines, 5))
+
+    try:
+        regex = re.compile(pattern, 0 if case_sensitive else re.IGNORECASE)
+    except re.error as e:
+        return {"error": f"Ungueltiges Regex-Muster: {e}"}
+
+    try:
+        matches: list[dict] = []
+        files_scanned = 0
+        files_searched = 0
+        truncated = False
+
+        for root, dirs, files in os.walk(abs_path, followlinks=False):
+            dirs[:] = [d for d in dirs if not is_path_blocked(os.path.join(root, d))]
+            for name in files:
+                files_scanned += 1
+                if files_scanned > MAX_RECURSIVE_ENTRIES:
+                    truncated = True
+                    break
+                if not fnmatch.fnmatch(name.lower(), file_pattern.lower()):
+                    continue
+                full = os.path.join(root, name)
+                try:
+                    if is_binary_file(full):
+                        continue
+                    if os.path.getsize(full) > MAX_CONTENT_SEARCH_FILE_SIZE:
+                        continue
+                except (PermissionError, FileNotFoundError, OSError):
+                    continue
+
+                try:
+                    with open(full, encoding="utf-8", errors="ignore") as fh:
+                        lines = fh.readlines()
+                except (PermissionError, FileNotFoundError, OSError):
+                    continue
+                files_searched += 1
+
+                for lineno, line in enumerate(lines, start=1):
+                    if regex.search(line):
+                        ctx_start = max(0, lineno - 1 - context_lines)
+                        ctx_end = min(len(lines), lineno + context_lines)
+                        entry: dict = {
+                            "file": os.path.relpath(full, abs_path),
+                            "absolute_path": full,
+                            "line": lineno,
+                            "text": line.rstrip("\n"),
+                        }
+                        if context_lines > 0:
+                            entry["context"] = "".join(lines[ctx_start:ctx_end]).rstrip("\n")
+                        matches.append(entry)
+                        if len(matches) >= max_results:
+                            truncated = True
+                            break
+                if truncated:
+                    break
+            if truncated:
+                break
+
+        return {
+            "success": True,
+            "path": path,
+            "pattern": pattern,
+            "file_pattern": file_pattern,
+            "matches": matches,
+            "count": len(matches),
+            "files_scanned": files_scanned,
+            "files_searched": files_searched,
+            "truncated": truncated,
         }
     except Exception as e:
         return {"error": f"Fehler: {e!s}"}

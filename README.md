@@ -57,6 +57,7 @@ Für minimale Installationen gibt es zwei Requirements-Dateien — installiere n
 | read_file_binary      | Datei als Base64-codierte Binärdaten lesen (max. 50 MB)| `path`                                               |
 | write_file            | Datei schreiben / anhängen (max. 50 MB)               | `path`, `content`, `append=False`, `encoding="utf-8"` |
 | write_file_binary     | Binärdaten (Base64) in Datei schreiben (max. 50 MB)   | `path`, `content`, `encoding="base64"`                |
+| find_replace           | Suchen & Ersetzen in Datei (literal/Regex, optional Backup) | `path`, `pattern`, `replacement`, `use_regex=False`, `count=0`, `backup=False` |
 | rename_file           | Datei oder Verzeichnis umbenennen                     | `path`, `new_name`                                    |
 | touch_file            | Zeitstempel aktualisieren oder Datei erstellen        | `path`, `times=None`                                  |
 | get_file_lines        | Zeilenbereich lesen (Start/Ende Zeile)                | `path`, `start=0`, `end=None`                         |
@@ -86,14 +87,15 @@ Für minimale Installationen gibt es zwei Requirements-Dateien — installiere n
 
 | Tool                 | Beschreibung                                                                   | Parameter                                         |
 |----------------------|--------------------------------------------------------------------------------|---------------------------------------------------|
-| compress_archive     | Datei/Verzeichnis als ZIP komprimieren (max. 10000 Dateien)                    | `path`, `archive_path`, `compression="DEFLATED"`  |
-| decompress_archive   | ZIP-Archiv entpacken — mit Path-Traversal-, Symlink- und Bomb-Schutz           | `archive_path`, `destination`                     |
+| compress_archive     | Archiv erstellen: ZIP oder Tarball (.tar.gz/.tgz/.tar.bz2/.tar.xz)             | `path`, `archive_path`, `compression="DEFLATED"` (nur ZIP)  |
+| decompress_archive   | ZIP/Tarball entpacken — mit Path-Traversal-, Symlink- und Bomb-Schutz           | `archive_path`, `destination`                     |
 
 ### Suche
 
 | Tool             | Beschreibung                                            | Parameter                                                        |
 |------------------|---------------------------------------------------------|------------------------------------------------------------------|
 | search_files     | Dateien mit Glob-Muster suchen (max. 10000 gescannt)    | `path`, `pattern="*"`, `max_results=100`, `case_sensitive=False` |
+| search_content   | Dateiinhalte durchsuchen (grep-artig, Regex, cross-platform) | `path`, `pattern`, `file_pattern="*"`, `max_results=50`, `context_lines=0` |
 | get_recent_files | Zuletzt geänderte Dateien finden                        | `path`, `max_results=20`, `time_range_days=7`                    |
 
 ### Informationen
@@ -134,6 +136,9 @@ für die vollständige Doku und Sicherheitsfeatures.
 | search_arxiv               | Wissenschaftliche Paper suchen                   |
 | search_gesti               | Gefahrstoffdaten suchen                          |
 | safe_web_scrape            | Sicheres Scraping beliebiger Webseiten           |
+| `search_github`              | GitHub-Repositories/Code suchen (sicher)         |
+| `search_news`                | Aktuelle Nachrichten (DuckDuckGo News)           |
+| `read_archived`              | Archivierte Seite via Wayback Machine lesen      |
 
 Start: `server_recherche.bat` oder `python internet_recherche.py --port 8766`.
 

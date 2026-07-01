@@ -905,6 +905,77 @@ class GESTISearcher:
         return results
 
 
+class GitHubSearcher:
+    """GitHub-Suche ueber die offizielle api.github.com.
+
+    Sicher: raw.githubusercontent.com bleibt blockiert; wir nutzen nur die
+    Such-API, die JSON-Metadaten (keinen Roquellcode) liefert. Code-Suche
+    erfordert einen Auth-Token (sonst liefert GitHub 401) - ohne Token wird
+    repositories-Suche verwendet.
+    """
+
+    GITHUB_API = "https://api.github.com/search"
+    UA = "llama-mcp-research/1.0 (Internet-Recherche; +https://github.com/DaWasteh/llama-mcp)"
+
+    def __init__(self, http_client: "SafeHttpClient"):
+        self.client = http_client
+
+    def search(self, query: str, search_type: str = "repositories",
+               max_results: int = MAX_SEARCH_RESULTS) -> list[SearchResult]:
+        endpoint = "code" if search_type == "code" else "repositories"
+        try:
+            data = self.client.fetch_json(
+                f"{self.GITHUB_API}/{endpoint}",
+                params={"q": query, "per_page": min(max_results, 10)},
+                headers={"User-Agent": self.UA, "Accept": "application/vnd.github+json"},
+            )
+        except Exception as e:
+            logger.error(f"GitHub-Fehler: {e}")
+            return []
+        if not isinstance(data, dict):
+            return []
+
+        results: list[SearchResult] = []
+        items = data.get("items", []) or []
+        for item in items[:max_results]:
+            if endpoint == "code":
+                repo = item.get("repository", {}) or {}
+                # Repo-URL als Primärlink: Datei-URLs (blob/.../*.py) enden oft auf
+                # blockierten Endungen und liefern ueber unseren Text-Fetch keinen
+                # Mehrwert. Dateipfad steht im Titel.
+                url = repo.get("html_url", "") or item.get("html_url", "")
+                title = f"{repo.get('full_name', '')}/{item.get('path', '')}"
+                snippet = item.get("name", "")
+            else:
+                url = item.get("html_url", "")
+                title = item.get("full_name", "")
+                stars = item.get("stargazers_count", 0)
+                desc = item.get("description") or ""
+                snippet = f"{desc} [★ {stars}]".strip()
+            if url and is_safe_url(url):
+                results.append(SearchResult(title=title, url=url, snippet=snippet, source="github"))
+        return results
+
+
+class NewsSearcher:
+    """Nachrichten-Suche via DuckDuckGo News (kein zusaetzlicher API-Key)."""
+
+    def search(self, query: str, max_results: int = MAX_SEARCH_RESULTS) -> list[SearchResult]:
+        results: list[SearchResult] = []
+        try:
+            ddgs = DDGS()
+            for r in ddgs.news(query, max_results=max_results):
+                url = r.get("url", "")
+                if url and is_safe_url(url):
+                    results.append(SearchResult(
+                        title=r.get("title", ""), url=url,
+                        snippet=r.get("body", ""), source="news",
+                    ))
+        except Exception as e:
+            logger.error(f"News-Fehler: {e}")
+        return results
+
+
 # ============================================================
 # Haupt-Recherche-Engine
 # ============================================================
@@ -919,6 +990,8 @@ class InternetResearchEngine:
         self.wiki = WikipediaSearcher(self.http_client)
         self.arxiv = ArXivSearcher(self.http_client)
         self.gesti = GESTISearcher()
+        self.github = GitHubSearcher(self.http_client)
+        self.news = NewsSearcher()
         self.rate_limiter = RateLimiter()
         self._visited_urls: set[str] = set()
         self._page_count = 0
@@ -1066,6 +1139,49 @@ class InternetResearchEngine:
             return {"success": False, "url": url, "error": "Seite konnte nicht gelesen werden"}
         finally:
             self.reset()
+
+    def get_archived(self, url: str) -> dict:
+        """Ruft eine archivierte Fassung der URL ueber die Wayback Machine ab.
+
+        Pieline (alles ueber SafeHttpClient -> DNS-/Size-/Content-Type-Schutz):
+          1. archive.org/wayback/available -> naechster Snapshot (JSON)
+          2. Snapshot-URL gegen is_safe_url pruefen (defense-in-depth)
+          3. Snapshot laden + HTML zu Text + sanitize_for_prompt
+        """
+        rl_error = self.check_rate_limit()
+        if rl_error:
+            rl_error["url"] = url
+            return rl_error
+        try:
+            avail = self.http_client.fetch_json(
+                "https://archive.org/wayback/available",
+                params={"url": url},
+            )
+            if not isinstance(avail, dict):
+                return {"success": False, "url": url, "error": "Archiv-API nicht erreichbar"}
+            closest = (avail.get("archived_snapshots") or {}).get("closest") or {}
+            snapshot_url = closest.get("url", "")
+            timestamp = closest.get("timestamp", "")
+            if not snapshot_url:
+                return {"success": False, "url": url, "error": "Kein archivierter Snapshot gefunden"}
+            if not is_safe_url(snapshot_url):
+                return {"success": False, "url": url, "error": "Snapshot-URL aus Sicherheitsgruenden blockiert"}
+            html_content = self.http_client.fetch(snapshot_url)
+            if not html_content:
+                return {"success": False, "url": url, "error": "Snapshot konnte nicht geladen werden"}
+            title = ""
+            with contextlib.suppress(Exception):
+                soup = BeautifulSoup(html_content[:MAX_HTML_PARSE_SIZE], "html.parser")
+                t = soup.find("title")
+                title = t.get_text(strip=True) if t else urlparse(url).hostname or ""
+            content = sanitize_for_prompt(sanitize_html_to_text(html_content))
+            return {
+                "success": True, "url": url, "snapshot_url": snapshot_url,
+                "timestamp": timestamp, "title": title, "content": content,
+            }
+        except Exception as e:
+            logger.error(f"Wayback-Fehler fuer {url}: {e}")
+            return {"success": False, "url": url, "error": "Ein interner Fehler ist aufgetreten"}
 
     def _read_page(self, url: str, source_hint: str) -> ScrapedPage | None:
         """Seite sicher lesen."""
@@ -1326,6 +1442,85 @@ def _register_tools_to_server(mcp_server):
             logger.error(f"search_gesti interner Fehler: {e!s}")
             return {"success": False, "error": "Ein interner Fehler ist aufgetreten",
                     "query": query, "results": []}
+
+    @tool_dec()
+    def search_github(query: str, search_type: str = "repositories", max_results: int = 5) -> dict:
+        """Durchsucht GitHub nach Repositories oder Code (via offizielle api.github.com).
+
+        Args:
+            query: Suchbegriff.
+            search_type: "repositories" (Default) oder "code".
+                        Code-Suche erfordert i.d.R. einen GitHub-Token.
+            max_results: Max. Ergebnisse (1-10).
+        """
+        try:
+            if search_type not in ("repositories", "code"):
+                search_type = "repositories"
+            max_results = max(1, min(max_results, 10))
+            eng = get_engine()
+            rl_error = eng.check_rate_limit()
+            if rl_error:
+                rl_error["query"] = query
+                return rl_error
+            results = eng.github.search(query, search_type=search_type, max_results=max_results)
+            formatted = [{
+                "title": r.title, "url": r.url,
+                "snippet": sanitize_for_prompt(r.snippet)[:400], "source": r.source,
+            } for r in results]
+            return {"success": True, "query": query, "search_type": search_type,
+                    "results": formatted, "count": len(formatted),
+                    "note": "Code-Suche benoetigt ggf. einen GitHub-Token (sonst leer)."}
+        except Exception as e:
+            logger.error(f"search_github interner Fehler: {e!s}")
+            return {"success": False, "error": "Ein interner Fehler ist aufgetreten",
+                    "query": query, "results": []}
+
+    @tool_dec()
+    def search_news(query: str, max_results: int = 5) -> dict:
+        """Sucht aktuelle Nachrichten (via DuckDuckGo News, kein API-Key).
+
+        Args:
+            query: Suchbegriff / Thema.
+            max_results: Max. Ergebnisse (1-10).
+        """
+        try:
+            max_results = max(1, min(max_results, 10))
+            eng = get_engine()
+            rl_error = eng.check_rate_limit()
+            if rl_error:
+                rl_error["query"] = query
+                return rl_error
+            results = eng.news.search(query, max_results=max_results)
+            formatted = [{
+                "title": r.title, "url": r.url,
+                "snippet": sanitize_for_prompt(r.snippet)[:300], "source": r.source,
+            } for r in results]
+            return {"success": True, "query": query, "results": formatted, "count": len(formatted)}
+        except Exception as e:
+            logger.error(f"search_news interner Fehler: {e!s}")
+            return {"success": False, "error": "Ein interner Fehler ist aufgetreten",
+                    "query": query, "results": []}
+
+    @tool_dec()
+    def read_archived(url: str) -> dict:
+        """Ruft eine archivierte Fassung einer URL ueber die Wayback Machine ab.
+
+        Nuetzlich fuer geloeschte/historische Seiten. Nutzt web.archive.org
+        (sichere, legitime Quelle) mit denselben Schranken wie read_webpage.
+
+        Args:
+            url: Original-URL, deren Archivfassung gesucht wird.
+        """
+        try:
+            parsed = urlparse(url)
+            if not parsed.scheme or not parsed.hostname:
+                return {"success": False, "error": "Ungueltige URL", "url": url}
+            if not is_safe_url(url):
+                return {"success": False, "error": "URL aus Sicherheitsgruenden blockiert", "url": url}
+            return get_engine().get_archived(url)
+        except Exception as e:
+            logger.error(f"read_archived interner Fehler: {e!s}")
+            return {"success": False, "error": "Ein interner Fehler ist aufgetreten", "url": url}
 
     @tool_dec()
     def safe_web_scrape(url: str, max_content_length: int = 3000) -> dict:

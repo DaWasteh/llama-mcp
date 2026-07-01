@@ -213,5 +213,104 @@ class TestServerSplit:
         expected = {
             "internet_research", "internet_research_detailed", "read_webpage",
             "search_wikipedia", "search_arxiv", "search_gesti", "safe_web_scrape",
+            "search_github", "search_news", "read_archived",
         }
         assert expected.issubset(got)
+
+
+# ---------------------------------------------------------------------------
+# Neue Quellen (v0.8): GitHub, News, Wayback - URL-Sicherheit & Fehlerpfade
+# ---------------------------------------------------------------------------
+
+
+class TestGitHubSearcher:
+    def _searcher(self, payload):
+        client = MagicMock()
+        client.fetch_json = lambda url, params=None, headers=None, max_size=None: payload
+        return ir.GitHubSearcher(client)
+
+    def test_repositories_results_filtered_for_safety(self):
+        s = self._searcher({"items": [
+            {"html_url": "https://github.com/owner/repo", "full_name": "owner/repo",
+             "stargazers_count": 42, "description": "A repo"},
+            {"html_url": "http://192.168.1.1/evil", "full_name": "x", "stargazers_count": 0},
+        ]})
+        results = s.search("test", search_type="repositories")
+        assert len(results) == 1
+        assert results[0].url == "https://github.com/owner/repo"
+        assert results[0].source == "github"
+        assert "42" in results[0].snippet
+
+    def test_non_dict_payload_returns_empty(self):
+        s = self._searcher(None)
+        assert s.search("x") == []
+
+    def test_code_search_endpoints(self):
+        s = self._searcher({"items": [
+            {"html_url": "https://github.com/o/r/blob/main/f.py", "name": "f.py",
+             "path": "f.py", "repository": {"full_name": "o/r", "html_url": "https://github.com/o/r"}},
+        ]})
+        results = s.search("test", search_type="code")
+        assert len(results) == 1
+        assert "o/r" in results[0].title
+
+
+class TestNewsSearcher:
+    def test_filters_unsafe_urls(self, monkeypatch):
+        class FakeDDGS:
+            def news(self, q, max_results=5):
+                return [
+                    {"url": "https://example.com/news/1", "title": "t", "body": "b"},
+                    {"url": "http://127.0.0.1/secret", "title": "x", "body": "y"},
+                ]
+        monkeypatch.setattr(ir, "DDGS", FakeDDGS)
+        results = ir.NewsSearcher().search("thema")
+        assert len(results) == 1
+        assert results[0].url == "https://example.com/news/1"
+        assert results[0].source == "news"
+
+    def test_ddgs_exception_returns_empty(self, monkeypatch):
+        class BoomDDGS:
+            def news(self, *a, **k):
+                raise RuntimeError("boom")
+        monkeypatch.setattr(ir, "DDGS", BoomDDGS)
+        assert ir.NewsSearcher().search("x") == []
+
+
+class TestReadArchivedWayback:
+    def _engine(self, fetch_json_payload, fetch_payload="<html><title>T</title><body>OK</body></html>"):
+        eng = ir.InternetResearchEngine()
+        eng.http_client.fetch_json = lambda url, params=None, headers=None, max_size=None: fetch_json_payload
+        eng.http_client.fetch = lambda url, **kw: fetch_payload
+        return eng
+
+    def test_unsafe_input_url_rejected_at_tool_level(self):
+        # read_archived-Tool validiert is_safe_url vor dem Engine-Aufruf.
+        r = ir.is_safe_url("http://192.168.1.1/secret")
+        assert r is False  # Voraussetzung fuer den Tool-Schutz
+
+    def test_unsafe_snapshot_url_rejected(self):
+        eng = self._engine({"archived_snapshots": {"closest": {
+            "url": "http://127.0.0.1/evil", "timestamp": "20200101"}}})
+        result = eng.get_archived("https://example.com/")
+        assert result["success"] is False
+        assert "blockiert" in result["error"]
+
+    def test_no_snapshot_found(self):
+        eng = self._engine({"archived_snapshots": {}})
+        result = eng.get_archived("https://example.com/")
+        assert result["success"] is False
+        assert "Kein archivierter Snapshot" in result["error"]
+
+    def test_success_path(self):
+        eng = self._engine(
+            {"archived_snapshots": {"closest": {
+                "url": "https://web.archive.org/web/20200101/https://example.com/",
+                "timestamp": "20200101"}}},
+            fetch_payload="<html><title>Archived</title><body>Historischer Inhalt</body></html>",
+        )
+        result = eng.get_archived("https://example.com/")
+        assert result["success"] is True
+        assert result["timestamp"] == "20200101"
+        assert "Historischer Inhalt" in result["content"]
+        assert result["snapshot_url"].startswith("https://web.archive.org")

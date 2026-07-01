@@ -22,6 +22,9 @@ im Netz durchführen.
 | **Wikipedia** | Deutsche und englische Wikipedia | `search_wikipedia`, `internet_research` |
 | **arXiv** | Wissenschaftliche Paper (Physik, Mathematik, KI, etc.) | `search_arxiv`, `internet_research` |
 | **GESTI** | Gefahrstoffdaten der BG BA (Deutschland) | `search_gesti`, `internet_research` |
+| **GitHub** | Repositories/Code via `api.github.com` (sicher) | `search_github` |
+| **News** | Aktuelle Nachrichten (DuckDuckGo News) | `search_news` |
+| **Wayback** | Archivierte/historische Seiten (`web.archive.org`) | `read_archived` |
 
 ## Verfügbare Tools
 
@@ -88,6 +91,31 @@ Sicheres Scraping beliebiger Webseiten.
 
 ```python
 safe_web_scrape("https://example.com/article", max_content_length=3000)
+```
+
+### 8. `search_github` (neu)
+
+GitHub-Suche über die offizielle `api.github.com` (sicher, kein `raw.githubusercontent`).
+
+```python
+search_github("llama.cpp mcp server", search_type="repositories")
+search_github("FastMCP streamable_http", search_type="code")  # braucht ggf. GitHub-Token
+```
+
+### 9. `search_news` (neu)
+
+Aktuelle Nachrichten via DuckDuckGo News (kein API-Key).
+
+```python
+search_news("KI-Regulierung EU")
+```
+
+### 10. `read_archived` (neu)
+
+Ruft eine archivierte Fassung einer URL über die Wayback Machine ab (für gelöschte/historische Seiten).
+
+```python
+read_archived("https://example.com/old-article")
 ```
 
 ## Sicherheitsfeatures
