@@ -24,6 +24,16 @@ Sicherheitspatches (Mai 2026):
 - [MITT] HTML-Groessenlimit (200KB) vor BeautifulSoup-Parsing
 - [MITT] arXiv-Endpoint von http auf https umgestellt
 - [MITT] arXiv-ID Regex unterstuetzt nun auch alte ID-Form (cs/9904001)
+
+Server-Split & Security-Haertung (Juli 2026):
+- [SERVER] Eigenstaendiger Server (main()+Port 8766), kein Coupling mehr
+- [KRIT] IP-Encoding-Erkennung (dezimal/hex/oktal) auf URL-Ebene, da
+         getaddrinfo plattformabhaengig ist und solche Forme z.T. nicht aufloest
+- [KRIT] Wikipedia/arXiv jetzt ueber SafeHttpClient (DNS-Rebinding, Size-
+         und Content-Type-Checks) statt eigener ungeschuetzter httpx-Clients
+- [HOCH] URL-Userinfo (http://user:pass@host) blockiert (Daten-Exfiltration)
+- [HOCH] Erweiterte Blockliste: .onion/.i2p/.localhost, weitere Paste-/File-Hoster
+- [HOCH] Content-Disposition: attachment mit gefaehrlicher Endung blockiert
 """
 
 import contextlib
@@ -36,7 +46,7 @@ import threading
 import unicodedata
 from collections import deque
 from dataclasses import dataclass
-from ipaddress import ip_address, ip_network
+from ipaddress import IPv4Address, ip_address, ip_network
 from time import time
 from typing import TYPE_CHECKING
 from urllib.parse import quote_plus, urljoin, urlparse
@@ -58,6 +68,8 @@ except ImportError as e:
     print(f"FEHLER: Fehlende Abhaengigkeit: {e}", file=sys.stderr)
     raise
 
+# Geteiltes Server-Bootstrap (CORS/Transport/uvicorn) - siehe server_common.py
+from server_common import build_argparser, run_mcp_server
 
 # ============================================================
 # Logger
@@ -96,16 +108,25 @@ _PROTECTED_NETWORKS = [
     ip_network("fe80::/10"),  # IPv6 Link-Local
 ]
 
-# Blockierte Domains
+# Blockierte Domains (Daten-Exfiltration, Code-Execution, ungefilterter Content)
 BLOCKED_DOMAINS = {
-    "pastebin.com", "gist.github.com", "hastebin.com", "paste.ee",
-    "0bin.net", "dpaste.com", "termbin.com", "0x0.st", "transfer.sh",
-    "file.io", "temp.sh", "raw.githubusercontent.com", "huggingface.co",
-    "cdn.jsdelivr.net", "unpkg.com", "jsdelivr.net",
+    # Paste- / Text-Dumps (Prompt-Injection- & Exfil-Vektor)
+    "pastebin.com", "gist.github.com", "gist.githubusercontent.com",
+    "hastebin.com", "paste.ee", "0bin.net", "dpaste.com", "termbin.com",
+    "0x0.st", "transfer.sh", "file.io", "temp.sh", "rentry.co", "rentry.org",
+    "paste.rs", "ix.io", "sprunge.us", "dumpz.org", "paste.org.ru",
+    "pastelink.net", "controlc.com", "paste.debian.net", "paste.centos.org",
+    # Code-Hoster / Modell-Hoster (ungefilterte Scripts/Modelle)
+    "raw.githubusercontent.com", "huggingface.co", "cdn.jsdelivr.net",
+    "unpkg.com", "jsdelivr.net", "codepen.io",
 }
 
-# Blockierte Domain-Suffixes (internes Netzwerk)
-BLOCKED_DOMAIN_SUFFIXES = (".internal", ".local", ".private", ".corp", ".home", ".lan")
+# Blockierte Domain-Suffixes (internes Netzwerk / Darknet / reserviert)
+BLOCKED_DOMAIN_SUFFIXES = (
+    ".internal", ".local", ".private", ".corp", ".home", ".lan",
+    ".onion", ".i2p", ".localhost",           # Darknet / Loopback-Hostname
+    ".test", ".example", ".invalid",           # RFC 2606 reserviert
+)
 
 # Blockierte URL-Endungen (Downloads/Executables)
 BLOCKED_EXTENSIONS = {
@@ -120,6 +141,42 @@ ALLOWED_SOURCES = {"duckduckgo", "wikipedia", "arxiv", "gesti"}
 def _is_ipv4_literal(hostname: str) -> bool:
     """Prueft ob Hostname eine IPv4-Literal-Notation ist."""
     return re.match(r"^\d{1,3}(\.\d{1,3}){3}$", hostname) is not None
+
+
+def _decode_ip_hostname(hostname: str) -> str | None:
+    """Erkennt nicht-dotted IPv4-Encodings und gibt dotted-Form zurueck.
+
+    Deckt klassische SSRF-Bypass-Vektoren ab, die getaddrinfo je Plattform
+    inkonsistent behandelt (Windows loest z.B. Integer-IPs NICHT auf):
+      - Dezimal:   2130706433        -> 127.0.0.1
+      - Hex:       0x7f000001        -> 127.0.0.1
+      - Oktal:     0177.0.0.1        -> 127.0.0.1  (pro-Oktett oktal)
+    Liefert None, wenn es keine gueltige codierte IPv4 ist.
+    """
+    h = hostname.lower()
+    # Reine Dezimal- oder Hex-Integer (ohne Punkt)
+    if h.isdigit() or (h.startswith("0x") and all(c in "0123456789abcdef" for c in h[2:])):
+        try:
+            base = 16 if h.startswith("0x") else 10
+            n = int(h, base)
+            if 0 <= n <= 0xFFFFFFFF:
+                return str(IPv4Address(n))
+        except ValueError:
+            return None
+        return None
+    # Oktal-dotted: alle Oktetts numerisch, mind. ein Oktett mit fuehrender Null
+    if "." in hostname:
+        parts = hostname.split(".")
+        if len(parts) == 4 and all(p.isdigit() for p in parts) and any(
+            len(p) > 1 and p.startswith("0") for p in parts
+        ):
+            try:
+                octets = [int(p, 8) for p in parts]
+                if all(0 <= o <= 255 for o in octets):
+                    return ".".join(str(o) for o in octets)
+            except ValueError:
+                return None
+    return None
 
 
 def _is_ipv6_literal(hostname: str) -> bool:
@@ -189,14 +246,25 @@ def is_safe_url(url: str) -> bool:
         if "\x00" in url:
             return False
 
+        # Userinfo (http://user:pass@host) blockieren - Daten-Exfiltrations-Vektor
+        # und potentielle Basic-Auth-Verschleierung.
+        if parsed.username or parsed.password:
+            return False
+
         hostname = parsed.hostname.lower().rstrip(".")
 
         # Blockiere localhost und bekannte interne Hostnames
         if hostname in ("localhost", "0.0.0.0", "127.0.0.1", "::1", "ip6-localhost", "ip6-loopback"):
             return False
 
-        # Blockiere private IP-Literale
+        # Blockiere private IP-Literale (dotted)
         if _is_ip_literal(hostname) and is_private_ip(hostname):
+            return False
+
+        # Blockiere codierte IPv4-Formen (dezimal/hex/oktal), die auf private
+        # Netze zeigen (z.B. 2130706433 -> 127.0.0.1).
+        decoded = _decode_ip_hostname(hostname)
+        if decoded is not None and is_private_ip(decoded):
             return False
 
         # Blockiere blockierte Domains und Subdomains
@@ -493,14 +561,43 @@ class SafeHttpClient:
             self._verified_hosts[hostname] = now
             return True
 
-    def fetch(self, url: str, max_size: int = MAX_RESPONSE_SIZE) -> str | None:
-        """Sichert eine URL mit Groessenlimit und DNS-Rebinding-Schutz."""
+    def _check_response(self, response, url: str, max_size: int) -> bool:
+        """Validiert eine HTTP-Antwort. True = sicher verwendbar.
+
+        Prueft (Defense-in-Depth):
+          - Antwort-IP nicht private (DNS-Rebinding belt-and-suspenders)
+          - Response-Groesse <= max_size (DoS-Schutz)
+          - Content-Type ist Text/HTML/XML/JSON (keine Binaries/Malware)
+          - Content-Disposition: attachment mit gefaehrlicher Endung -> blockiert
+        """
+        response_host = response.url.host
+        if response_host and _is_ip_literal(response_host) and is_private_ip(response_host):
+            logger.warning(f"Antwort von privater IP: {response_host}")
+            return False
+
+        if len(response.content) > max_size:
+            logger.warning(f"Response zu gross: {len(response.content)} bytes")
+            return False
+
+        content_type = response.headers.get("content-type", "").lower()
+        if not any(t in content_type for t in ("text/html", "text/plain", "xml", "json")):
+            logger.warning(f"Nicht-Text Content-Type: {content_type}")
+            return False
+
+        # Attachment-Download mit gefaehrlicher Endung blocken (Malware-Vektor)
+        disposition = response.headers.get("content-disposition", "").lower()
+        if "attachment" in disposition and any(ext in disposition for ext in BLOCKED_EXTENSIONS):
+            logger.warning(f"Attachment mit gefaehrlicher Endung blockiert: {self._sanitize_url_for_logging(url)}")
+            return False
+        return True
+
+    def _safe_get(self, url: str, params=None, headers=None, max_size: int = MAX_RESPONSE_SIZE):
+        """GET mit allen Sicherheitschecks. Liefert httpx.Response oder None."""
         if not is_safe_url(url):
             logger.warning(f"Blockierte unsichere URL: {self._sanitize_url_for_logging(url)}")
             return None
 
-        parsed = urlparse(url)
-        hostname = (parsed.hostname or "").lower()
+        hostname = (urlparse(url).hostname or "").lower()
 
         # DNS-Rebinding-Schutz: Frische Validierung pro Request
         if not self._verify_host_fresh(hostname):
@@ -508,26 +605,10 @@ class SafeHttpClient:
             return None
 
         try:
-            response = self.session.get(url)
-
-            # Belt-and-suspenders: Pruefe nach Verbindung, ob der Host nicht
-            # auf eine private IP gemappt wurde (theoretisch unmoeglich, da
-            # follow_redirects=False, aber als zusaetzliche Sicherheit)
-            response_host = response.url.host
-            if response_host and _is_ip_literal(response_host) and is_private_ip(response_host):
-                logger.warning(f"Antwort von privater IP: {response_host}")
+            response = self.session.get(url, params=params, headers=headers)
+            if not self._check_response(response, url, max_size):
                 return None
-
-            if len(response.content) > max_size:
-                logger.warning(f"Response zu gross: {len(response.content)} bytes")
-                return None
-
-            content_type = response.headers.get("content-type", "").lower()
-            if not any(t in content_type for t in ("text/html", "text/plain", "xml", "json")):
-                logger.warning(f"Nicht-Text Content-Type: {content_type}")
-                return None
-
-            return str(response.text)
+            return response
         except httpx.TimeoutException:
             logger.warning(f"Timeout bei {self._sanitize_url_for_logging(url)}")
             return None
@@ -539,6 +620,33 @@ class SafeHttpClient:
             return None
         except Exception:
             logger.warning(f"Fehler bei {self._sanitize_url_for_logging(url)}: [interner Fehler]")
+            return None
+
+    def fetch(self, url: str, *, params=None, headers=None, max_size: int = MAX_RESPONSE_SIZE) -> str | None:
+        """Sichert eine URL mit Groessenlimit und DNS-Rebinding-Schutz (Text)."""
+        response = self._safe_get(url, params=params, headers=headers, max_size=max_size)
+        return str(response.text) if response is not None else None
+
+    def fetch_json(
+        self,
+        url: str,
+        params: "Mapping[str, str | int | float | bool | None] | None" = None,
+        headers: "Mapping[str, str] | None" = None,
+        max_size: int = MAX_RESPONSE_SIZE,
+    ) -> object | None:
+        """Wie fetch(), aber mit Query-Params und JSON-Parsing.
+
+        Fuer vertrauenswuerdige JSON-APIs (Wikipedia). XML-APIs (arXiv)
+        stattdessen fetch() verwenden.
+        """
+        response = self._safe_get(url, params=params, headers=headers, max_size=max_size)
+        if response is None:
+            return None
+        try:
+            data: object = response.json()
+            return data
+        except ValueError:
+            logger.warning(f"Ungueltiges JSON von {self._sanitize_url_for_logging(url)}")
             return None
 
     def close(self):
@@ -570,9 +678,12 @@ class DuckDuckGoSearcher:
 
 
 class WikipediaSearcher:
-    """Wikipedia-Suchmaschine."""
+    """Wikipedia-Suchmaschine (ueber SafeHttpClient -> DNS-/Size-Schutz aktiv)."""
 
     WIKI_API_URL = "https://{lang}.wikipedia.org/w/api.php"
+
+    def __init__(self, http_client: "SafeHttpClient"):
+        self.client = http_client
 
     def search(self, query: str, max_results: int = MAX_SEARCH_RESULTS) -> list[SearchResult]:
         results: list[SearchResult] = []
@@ -591,21 +702,21 @@ class WikipediaSearcher:
                     "srinfo": "suggestion",
                 }
                 headers = {"User-Agent": "llama-mcp-research/1.0 (Internet-Recherche; +https://github.com/Sebas/llama-mcp)"}
-                with httpx.Client(timeout=HTTP_TIMEOUT, follow_redirects=False, headers=headers) as client:
-                    response = client.get(api_url, params=params)  # type: ignore[arg-type]
-                    data = response.json()
-                    search_terms = data.get("query", {}).get("search", [])
-                    for term in search_terms:
-                        title = term.get("title", "")
-                        snippet = term.get("snippet", "")
-                        article_url = f"https://{lang}.wikipedia.org/wiki/{quote_plus(title)}"
-                        results.append(SearchResult(
-                            title=title, url=article_url,
-                            snippet=self._clean_wikipedia_snippet(snippet),
-                            source=f"wikipedia({lang})",
-                        ))
-                        if len(results) >= max_results:
-                            break
+                data = self.client.fetch_json(api_url, params=params, headers=headers)
+                if not isinstance(data, dict):
+                    continue
+                search_terms = data.get("query", {}).get("search", [])
+                for term in search_terms:
+                    title = term.get("title", "")
+                    snippet = term.get("snippet", "")
+                    article_url = f"https://{lang}.wikipedia.org/wiki/{quote_plus(title)}"
+                    results.append(SearchResult(
+                        title=title, url=article_url,
+                        snippet=self._clean_wikipedia_snippet(snippet),
+                        source=f"wikipedia({lang})",
+                    ))
+                    if len(results) >= max_results:
+                        break
             except Exception as e:
                 logger.error(f"Wikipedia({lang})-Fehler: {e}")
                 continue
@@ -641,23 +752,23 @@ class WikipediaSearcher:
                 "format": "json",
             }
             headers = {"User-Agent": "llama-mcp-research/1.0 (Internet-Recherche; +https://github.com/Sebas/llama-mcp)"}
-            with httpx.Client(timeout=HTTP_TIMEOUT, follow_redirects=False, headers=headers) as client:
-                response = client.get(api_url, params=params)  # type: ignore[arg-type]
-                data = response.json()
-                pages = data.get("query", {}).get("pages", {})
-                for _page_id, page_data in pages.items():
-                    if page_data.get("missing"):
-                        return None
-                    article_title = page_data.get("title", "")
-                    extract = page_data.get("extract", "")
-                    if extract:
-                        if len(extract) > MAX_RESULT_LENGTH:
-                            extract = extract[:MAX_RESULT_LENGTH] + "\n... [gekuerzt]"
-                        sanitized = sanitize_for_prompt(extract)
-                        return ScrapedPage(
-                            url=url, title=article_title, content=sanitized,
-                            links=[], source=f"wikipedia({lang})",
-                        )
+            data = self.client.fetch_json(api_url, params=params, headers=headers)
+            if not isinstance(data, dict):
+                return None
+            pages = data.get("query", {}).get("pages", {})
+            for _page_id, page_data in pages.items():
+                if page_data.get("missing"):
+                    return None
+                article_title = page_data.get("title", "")
+                extract = page_data.get("extract", "")
+                if extract:
+                    if len(extract) > MAX_RESULT_LENGTH:
+                        extract = extract[:MAX_RESULT_LENGTH] + "\n... [gekuerzt]"
+                    sanitized = sanitize_for_prompt(extract)
+                    return ScrapedPage(
+                        url=url, title=article_title, content=sanitized,
+                        links=[], source=f"wikipedia({lang})",
+                    )
             return None
         except Exception as e:
             logger.error(f"Wikipedia-Artikel-Fehler: {e}")
@@ -665,43 +776,47 @@ class WikipediaSearcher:
 
 
 class ArXivSearcher:
-    """arXiv-Suchmaschine fuer wissenschaftliche Paper."""
+    """arXiv-Suchmaschine fuer wissenschaftliche Paper (ueber SafeHttpClient)."""
 
     ARXIV_API = "https://export.arxiv.org/api/query"  # https statt http (Patch)
 
+    def __init__(self, http_client: "SafeHttpClient"):
+        self.client = http_client
+
     def search(self, query: str, max_results: int = MAX_SEARCH_RESULTS) -> list[SearchResult]:
-        results = []
+        results: list[SearchResult] = []
         try:
-            with httpx.Client(timeout=HTTP_TIMEOUT, follow_redirects=False) as client:
-                response = client.get(self.ARXIV_API, params={
-                    "query": f"all:{query}",
-                    "start": 0,
-                    "max_results": min(max_results, 10),
-                    "sortBy": "relevance",
-                    "sortOrder": "descending",
-                })
-                from xml.etree import ElementTree
-                root = ElementTree.fromstring(response.content)
-                namespace = {
-                    "atom": "http://www.w3.org/2005/Atom",
-                    "opensearch": "http://a9.com/-/spec/opensearch/1.1/",
-                }
-                for entry in root.findall(".//atom:entry", namespace):
-                    title = (entry.findtext("atom:title", "") or "").strip().replace("\n", " ")
-                    summary = (entry.findtext("atom:summary", "") or "").strip().replace("\n", " ")
-                    link = entry.findtext("atom:link", "") or ""
-                    abstract_url = ""
-                    for link_elem in entry.findall("atom:link", namespace):
-                        href = link_elem.get("href", "")
-                        if "abs" in href.lower() or "entry" in href.lower():
-                            abstract_url = href
-                    if not abstract_url:
-                        abstract_url = link
-                    if abstract_url and is_safe_url(abstract_url):
-                        results.append(SearchResult(
-                            title=title, url=abstract_url,
-                            snippet=self._clean_arxiv_text(summary), source="arxiv",
-                        ))
+            xml_text = self.client.fetch(self.ARXIV_API, params={
+                "query": f"all:{query}",
+                "start": 0,
+                "max_results": min(max_results, 10),
+                "sortBy": "relevance",
+                "sortOrder": "descending",
+            })
+            if not xml_text:
+                return results
+            from xml.etree import ElementTree
+            root = ElementTree.fromstring(xml_text)
+            namespace = {
+                "atom": "http://www.w3.org/2005/Atom",
+                "opensearch": "http://a9.com/-/spec/opensearch/1.1/",
+            }
+            for entry in root.findall(".//atom:entry", namespace):
+                title = (entry.findtext("atom:title", "") or "").strip().replace("\n", " ")
+                summary = (entry.findtext("atom:summary", "") or "").strip().replace("\n", " ")
+                link = entry.findtext("atom:link", "") or ""
+                abstract_url = ""
+                for link_elem in entry.findall("atom:link", namespace):
+                    href = link_elem.get("href", "")
+                    if "abs" in href.lower() or "entry" in href.lower():
+                        abstract_url = href
+                if not abstract_url:
+                    abstract_url = link
+                if abstract_url and is_safe_url(abstract_url):
+                    results.append(SearchResult(
+                        title=title, url=abstract_url,
+                        snippet=self._clean_arxiv_text(summary), source="arxiv",
+                    ))
         except Exception as e:
             logger.error(f"arXiv-Fehler: {e}")
         return results[:max_results]
@@ -717,35 +832,36 @@ class ArXivSearcher:
 
     def get_paper_details(self, url: str) -> ScrapedPage | None:
         try:
-            with httpx.Client(timeout=HTTP_TIMEOUT, follow_redirects=False) as client:
-                arxiv_id = urlsplit_id(url)
-                if not arxiv_id:
-                    return None
-                response = client.get(self.ARXIV_API, params={
-                    "search_query": f"id:{arxiv_id}", "max_results": 1,
-                })
-                from xml.etree import ElementTree
-                root = ElementTree.fromstring(response.content)
-                namespace = {"atom": "http://www.w3.org/2005/Atom"}
-                for entry in root.findall(".//atom:entry", namespace):
-                    title = (entry.findtext("atom:title", "") or "").strip().replace("\n", " ")
-                    summary = (entry.findtext("atom:summary", "") or "").strip().replace("\n", " ")
-                    authors = []
-                    for author in entry.findall("atom:author", namespace):
-                        name = author.findtext("atom:name", "") or ""
-                        if name:
-                            authors.append(name)
-                    if summary:
-                        content = (
-                            f"Titel: {title}\n"
-                            f"Autoren: {', '.join(authors)}\n\n"
-                            f"Zusammenfassung:\n{self._clean_arxiv_text(summary)}"
-                        )
-                        if len(content) > MAX_RESULT_LENGTH:
-                            content = content[:MAX_RESULT_LENGTH] + "\n... [gekuerzt]"
-                        sanitized = sanitize_for_prompt(content)
-                        return ScrapedPage(url=url, title=title, content=sanitized,
-                                          links=[], source="arxiv")
+            arxiv_id = urlsplit_id(url)
+            if not arxiv_id:
+                return None
+            xml_text = self.client.fetch(self.ARXIV_API, params={
+                "search_query": f"id:{arxiv_id}", "max_results": 1,
+            })
+            if not xml_text:
+                return None
+            from xml.etree import ElementTree
+            root = ElementTree.fromstring(xml_text)
+            namespace = {"atom": "http://www.w3.org/2005/Atom"}
+            for entry in root.findall(".//atom:entry", namespace):
+                title = (entry.findtext("atom:title", "") or "").strip().replace("\n", " ")
+                summary = (entry.findtext("atom:summary", "") or "").strip().replace("\n", " ")
+                authors = []
+                for author in entry.findall("atom:author", namespace):
+                    name = author.findtext("atom:name", "") or ""
+                    if name:
+                        authors.append(name)
+                if summary:
+                    content = (
+                        f"Titel: {title}\n"
+                        f"Autoren: {', '.join(authors)}\n\n"
+                        f"Zusammenfassung:\n{self._clean_arxiv_text(summary)}"
+                    )
+                    if len(content) > MAX_RESULT_LENGTH:
+                        content = content[:MAX_RESULT_LENGTH] + "\n... [gekuerzt]"
+                    sanitized = sanitize_for_prompt(content)
+                    return ScrapedPage(url=url, title=title, content=sanitized,
+                                      links=[], source="arxiv")
             return None
         except Exception as e:
             logger.error(f"arXiv-Paper-Fehler: {e}")
@@ -800,8 +916,8 @@ class InternetResearchEngine:
     def __init__(self):
         self.http_client = SafeHttpClient()
         self.ddg = DuckDuckGoSearcher()
-        self.wiki = WikipediaSearcher()
-        self.arxiv = ArXivSearcher()
+        self.wiki = WikipediaSearcher(self.http_client)
+        self.arxiv = ArXivSearcher(self.http_client)
         self.gesti = GESTISearcher()
         self.rate_limiter = RateLimiter()
         self._visited_urls: set[str] = set()
@@ -1252,6 +1368,39 @@ def _register_tools_to_server(mcp_server):
 _register_tools_to_server(mcp_research)
 
 
+# Eigenstaendiger Server-Name + Default-Port (eigenstaendig vom Dateisystem-Server)
+RESEARCH_SERVER_NAME = "internet-research-server"
+RESEARCH_DEFAULT_PORT = 8766
+
+
+def main() -> None:
+    """Startet den Internet-Recherche-MCP-Server als eigenstaendigen Prozess."""
+    args = build_argparser(RESEARCH_SERVER_NAME, default_port=RESEARCH_DEFAULT_PORT).parse_args()
+
+    logger.info("Internet-Recherche Server starting...")
+    logger.info("Erlaubte Quellen: DuckDuckGo, Wikipedia, arXiv, GESTI")
+    logger.info("Quellen außerhalb dieser Liste werden strikt blockiert (SSRF/Schutz).")
+
+    run_mcp_server(
+        mcp=mcp_research,
+        server_name=RESEARCH_SERVER_NAME,
+        host=args.host,
+        port=args.port,
+        transport=args.transport,
+        streamable_http_app_factory=mcp_research.streamable_http_app,
+        sse_app_factory=mcp_research.sse_app,
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+
 def register_research_tools(mcp_instance):
-    """Registriert alle Internet-Recherche-Tools auf einem bestehenden MCP-Server."""
+    """Registriert alle Internet-Recherche-Tools auf einem bestehenden MCP-Server.
+
+    Kompatibilitaets-API fuer externe Einbinder, die die Tools in einen eigenen
+    FastMCP-Server mounten wollen. Der Dateisystem-Server selbst nutzt diese nicht
+    mehr - die Server sind sauber getrennt.
+    """
     _register_tools_to_server(mcp_instance)

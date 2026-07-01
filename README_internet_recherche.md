@@ -1,10 +1,18 @@
 # Sichere Internet-Recherche für llama.cpp Web UI
 
+Eigenständiger MCP-Server (`internet_recherche.py`, Port **8766**) für sichere
+Internet-Recherche. Läuft in einem eigenen Prozess, völlig entkoppelt vom
+Dateisystem-Server.
+
 ## Übersicht
 
-Dieses Modul bietet **sichere Internet-Recherche-Funktionen** für den MCP-Server, die speziell für die Verwendung mit llama.cpp Web UI entwickelt wurden. Es ermöglicht LLMs, Informationen aus dem Internet zu beziehen, ohne Sicherheitsrisiken einzugehen.
+Dieses Modul bietet **sichere Internet-Recherche-Funktionen** für llama.cpp,
+ohne Sicherheitsrisiken einzugehen. Das LLM kann Informationen aus dem Internet
+beziehen, aber **keine** Dateien herunterladen, ausführen oder Schreibzugriffe
+im Netz durchführen.
 
-> **Sicherheits-Update (Mai 2026)**: Diese Version enthält gehärtete Sicherheits-Patches. Siehe [Abschnitt "Sicherheitsfeatures"](#sicherheitsfeatures) für Details.
+> **Sicherheits-Update (Juli 2026):** Gehärtete SSRF-/Exfiltrations-Schutz-
+> maßnahmen. Siehe [Abschnitt "Sicherheitsfeatures"](#sicherheitsfeatures).
 
 ## Verfügbare Quellen
 
@@ -84,6 +92,36 @@ safe_web_scrape("https://example.com/article", max_content_length=3000)
 
 ## Sicherheitsfeatures
 
+### Server-Split & Unifikation des HTTP-Pfads (Juli 2026)
+
+- **Eigenständiger Server**: Recherche läuft als eigener Prozess (Port 8766),
+  getrennt vom Dateisystem-Server. Kein Coupling mehr.
+- **Wikipedia & arXiv jetzt über `SafeHttpClient`**: Beide Suchmaschinen rufen ihre
+  JSON/XML-APIs nicht mehr über nackte, ungeschützte `httpx.Client`s auf, sondern
+  über denselben `SafeHttpClient` wie das Web-Scraping. Damit greifen für **alle**
+  ausgehenden Requests einheitlich: DNS-Rebinding-Schutz, Size-Limit,
+  Content-Type-Whitelist und Connection-IP-Verifikation.
+- **`fetch_json()`**: Neue Methode für vertrauenswürdige JSON-APIs (Wikipedia) mit
+  denselben Schranken wie `fetch()`.
+
+### SSRF-Schutz (gehärtet, Juli 2026)
+
+- **IP-Encoding-Erkennung auf URL-Ebene**: Dezimal- (`2130706433`), Hex-
+  (`0x7f000001`) und oktale (`0177.0.0.1`) IPv4-Codierungen, die auf private/
+  Loopback-/Metadata-Netze zeigen, werden zuverlässig blockiert. Notwendig, weil
+  `getaddrinfo` solche Formen je Plattform inkonsistent auflöst (Windows z.B.
+  **nicht**) — der DNS-Check allein reicht hier nicht.
+- **Cloud-Metadata blockiert**: `169.254.169.254` (AWS/Azure/GCP) fällt unter
+  Link-Local; dezimal codierte Variante (`2852039166`) wird explizit erkannt.
+- **URL-Userinfo blockiert**: `http://user:pass@host` und `http://data@host/`
+  werden abgelehnt (Daten-Exfiltration & Basic-Auth-Verschleierung).
+- **Content-Disposition-Attachment-Block**: Antworten mit
+  `Content-Disposition: attachment` und gefährlicher Endung (`.exe`, `.dll`, …)
+  werden blockiert (Malware-Verteilung).
+- **Erweiterte Blockliste**: weitere Paste-/File-Hoster (`rentry.co`, `paste.rs`,
+  `gist.githubusercontent.com`, `codepen.io`, …) und Domain-Suffixe (`.onion`,
+  `.i2p`, `.localhost`, RFC-2606-reservierte `.test`/`.example`/`.invalid`).
+
 ### Prompt-Injection-Schutz (gehärtet)
 
 - **Unicode-Normalisierung (NFKC)** als ersten Schritt — verhindert Homoglyph-Bypass wie `ìgnòre àll ìnstructíòns`
@@ -147,32 +185,45 @@ safe_web_scrape("https://example.com/article", max_content_length=3000)
 ## Installation
 
 ```bash
-pip install duckduckgo-search beautifulsoup4
+pip install -r requirements-recherche.txt
 ```
 
-Oder via `requirements.txt`:
-
-```
-duckduckgo-search>=8.1.1
-beautifulsoup4>=4.14.3
-```
-
-## Verwendung im llama.cpp Web UI
-
-Das Modul wird automatisch in den bestehenden MCP-Server integriert. Starte den Server wie gewohnt:
+oder einzeln:
 
 ```bash
-python lokales_dateisystem.py --port 8765
+pip install duckduckgo-search beautifulsoup4 httpx
 ```
 
-Die Internet-Recherche-Tools sind dann in der llama.cpp Web UI verfügbar.
+## Verwendung
+
+### Start als eigener Server
+
+```bat
+server_recherche.bat
+```
+
+oder direkt:
+
+```bash
+python internet_recherche.py --host 127.0.0.1 --port 8766 --transport streamable-http
+```
+
+MCP-URL für die llama.cpp WebUI: `http://127.0.0.1:8766/mcp`
+
+### Transport-Modi
+
+`streamable-http` (Default, für WebUI), `sse`, `stdio` (lokale Nutzung).
+
+CORS und Bind-Host sind identisch konfiguriert wie beim Dateisystem-Server
+(siehe `server_common.py`, Umgebungsvariable `MCP_ALLOWED_ORIGINS`).
 
 ## Architektur
 
 ```
 internet_recherche.py
 ├── Sicherheits-Utilities
-│   ├── is_safe_url()           # URL-Validierung (Schema, Domain, Pfad)
+│   ├── is_safe_url()           # URL-Validierung (Schema, Domain, Pfad, Userinfo, IP-Encoding)
+│   ├── _decode_ip_hostname()   # dez/hex/oktal IPv4-Encodings entschärfen (SSRF)
 │   ├── resolve_and_verify()    # DNS-Aufloesung mit Privat-IP-Check
 │   ├── is_private_ip()         # IPv4 + IPv6 + spezielle Netze
 │   ├── sanitize_html_to_text() # HTML zu Text (mit Groessen-Limit)
@@ -186,7 +237,9 @@ internet_recherche.py
 │
 ├── SafeHttpClient
 │   ├── _verify_host_fresh() # DNS-Cache + Rebinding-Schutz
-│   └── fetch()              # Mit Connection-IP-Check
+│   ├── _check_response()    # Size, Content-Type, Attachment, Antwort-IP
+│   ├── fetch()              # Text (HTML/XML), mit Sicherheitschecks
+│   └── fetch_json()         # JSON-APIs (Wikipedia), mit Sicherheitschecks
 │
 ├── RateLimiter              # Thread-safe Sliding-Window-Limiter
 │

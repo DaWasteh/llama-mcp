@@ -16,7 +16,6 @@ Sicherheits-Patches (Mai 2026):
 - [MITT] Loggen sicherheitsrelevanter Ereignisse
 """
 
-import argparse
 import base64
 import binascii
 import contextlib
@@ -61,6 +60,8 @@ except ImportError as e:
     print("Fuehre aus: pip install --upgrade mcp", file=sys.stderr)
     sys.exit(1)
 
+# Geteiltes Server-Bootstrap (CORS/Transport/uvicorn) - siehe server_common.py
+from server_common import build_argparser, run_mcp_server  # noqa: E402
 
 # ============================================================
 # Konfiguration
@@ -211,23 +212,11 @@ def is_binary_file(path: str) -> bool:
 
 
 # ============================================================
-# FastMCP Server-Instanz
+# FastMCP Server-Instanz (eigenstaendig, kein Research-Coupling mehr).
+# Internet-Recherche laeuft als eigener Server -> siehe internet_recherche.py
 # ============================================================
 
 mcp = FastMCP(SERVER_NAME)
-
-
-# ============================================================
-# Internet-Recherche-Tools importieren (optional)
-# ============================================================
-try:
-    from internet_recherche import register_research_tools
-
-    register_research_tools(mcp)
-    logger.info("Internet-Recherche-Tools aktiviert.")
-except ImportError as e:
-    logger.warning(f"Internet-Recherche-Tools nicht verfuegbar: {e}")
-    logger.warning("Installiere mit: pip install duckduckgo-search beautifulsoup4")
 
 
 # ============================================================
@@ -1545,6 +1534,9 @@ def get_user_directories() -> dict:
 
         if IS_WINDOWS:
             import ctypes
+            # SHGetFolderPathW(hwnd, nFolder, hToken, dwFlags, pszPath(LPWSTR-Buffer)).
+            # Der pszPath-Buffer (5. Argument) ist PFLICHT - ohne ihn schreibt die
+            # Funktion nach NULL -> Access Violation (interpreter crash).
             folders_map = {
                 "Desktop": 0x0010, "Documents": 0x0005, "Downloads": 0x001E,
                 "Music": 0x000B, "Pictures": 0x000C, "Videos": 0x000E,
@@ -1553,8 +1545,12 @@ def get_user_directories() -> dict:
             }
             for folder_name, folder_id in folders_map.items():
                 try:
-                    path = ctypes.windll.shell32.SHGetFolderPathW(None, folder_id, None, 0)  # type: ignore[attr-defined]
-                    result[folder_name] = path
+                    buf = ctypes.create_unicode_buffer(260)  # MAX_PATH
+                    # Rueckgabe 0 == S_OK
+                    if ctypes.windll.shell32.SHGetFolderPathW(None, folder_id, None, 0, buf) == 0:  # type: ignore[attr-defined]
+                        result[folder_name] = buf.value
+                    else:
+                        result[folder_name] = str(home / folder_name.replace("_", "/"))
                 except Exception:
                     result[folder_name] = str(home / folder_name.replace("_", "/"))
         else:
@@ -1860,143 +1856,23 @@ def create_hardlink(path: str, target: str) -> dict:
 # ============================================================
 
 
-def _parse_allowed_origins(env_value: str) -> list[str]:
-    """Parst die MCP_ALLOWED_ORIGINS Umgebungsvariable.
-
-    Komma-getrennte Liste. Bei Leerstring oder "*" wird "*" zurueckgegeben (warnt).
-    """
-    if not env_value or env_value.strip() == "*":
-        logger.warning(
-            "MCP_ALLOWED_ORIGINS ist '*' oder leer - jede Website kann den Server aufrufen. "
-            "Setze MCP_ALLOWED_ORIGINS auf eine kommagetrennte Liste fuer Produktion."
-        )
-        return ["*"]
-    origins = [o.strip() for o in env_value.split(",") if o.strip()]
-    return origins or ["*"]
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="MCP Filesystem Server")
-    parser.add_argument("--host", default="127.0.0.1", help="Host (Default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=8765, help="Port (Default: 8765)")
-    parser.add_argument(
-        "--transport",
-        default="streamable-http",
-        choices=["streamable-http", "sse", "stdio"],
-        help="MCP Transport (Default: streamable-http fuer llama.cpp WebUI)",
-    )
-    args = parser.parse_args()
+    args = build_argparser(SERVER_NAME, default_port=8765).parse_args()
 
     logger.info("Filesystem Server starting...")
-    logger.info(f"Root directory: {DEFAULT_ROOT}")
-    logger.info(f"OS: {platform.system()} {platform.release()}")
-    logger.info(f"Python: {platform.python_version()}")
-    logger.info(f"Transport: {args.transport}")
+    logger.info("Root directory: %s", DEFAULT_ROOT)
+    logger.info("OS: %s %s", platform.system(), platform.release())
+    logger.info("Python: %s", platform.python_version())
 
-    # Sicherheitswarnung bei Bind auf 0.0.0.0
-    if args.host in ("0.0.0.0", "::"):
-        logger.warning(
-            "SICHERHEITSWARNUNG: Server bindet auf alle Interfaces. "
-            "In Netzwerken ist der Server damit von ausserhalb erreichbar. "
-            "Empfehlung: --host 127.0.0.1"
-        )
-
-    if args.transport in ("streamable-http", "sse"):
-        import asyncio
-
-        import uvicorn
-        from starlette.middleware.cors import CORSMiddleware
-        from starlette.requests import Request
-        from starlette.responses import JSONResponse, StreamingResponse
-        from starlette.routing import Route
-
-        if args.transport == "streamable-http":
-            app = mcp.streamable_http_app()
-            endpoint = "/mcp"
-        else:
-            app = mcp.sse_app()
-            endpoint = "/sse"
-
-        # CORS jetzt konfigurierbar (Patch: nicht mehr hardcoded "*")
-        # Default fuer lokalen llama.cpp-Use-Case ist localhost; in
-        # Produktion sollte MCP_ALLOWED_ORIGINS gesetzt werden.
-        cors_default = "http://127.0.0.1:8080,http://localhost:8080,http://127.0.0.1:8765,http://localhost:8765,http://127.0.0.1:1234,http://localhost:1234"
-        origins_env = os.environ.get("MCP_ALLOWED_ORIGINS", cors_default)
-        allowed_origins = _parse_allowed_origins(origins_env)
-        logger.info(f"CORS allowed_origins: {allowed_origins}")
-
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=allowed_origins,
-            allow_credentials=False,
-            allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-            allow_headers=["mcp-session-id", "mcp-protocol-version", "Content-Type", "Authorization"],
-            expose_headers=["mcp-session-id", "mcp-protocol-version"],
-        )
-
-        # GET-Route fuer StreamableHTTP-SSE-Push (von llama.cpp WebUI verwendet)
-        if args.transport == "streamable-http":
-
-            # Finde den Session-Manager in den App-Extensions
-            _app_state = getattr(app, "_state", {})
-            _session_manager = _app_state.get("session_manager")
-
-            async def sse_stream(request: Request):
-                async def event_stream():
-                    if _session_manager is None:
-                        yield 'data: {"error":"Session manager not available"}\n\n'
-                        return
-                    try:
-                        # Erstelle einen neuen Context fuer die SSE-Verbindung
-                        session_id = request.headers.get("mcp-session-id", "")
-                        if session_id:
-                            # Bestehende Session verwenden
-                            conn = _session_manager._sessions.get(session_id)
-                            if conn:
-                                async for event in conn.response_queue:
-                                    yield event
-                                    await asyncio.sleep(0.1)
-                            else:
-                                yield 'data: {"error":"Session not found"}\n\n'
-                                return
-                        else:
-                            yield 'data: {"error":"No session ID"}\n\n'
-                            return
-                    except asyncio.CancelledError:
-                        return
-                    except Exception as e:
-                        yield f'data: {{"error":"{e}"}}\n\n'
-                        return
-
-                return StreamingResponse(
-                    event_stream(),
-                    media_type="text/event-stream",
-                    headers={
-                        "cache-control": "no-cache",
-                        "connection": "keep-alive",
-                    },
-                )
-
-            app.routes.append(Route(endpoint, sse_stream, methods=["GET"]))
-
-        async def root(_request):
-            return JSONResponse({
-                "server": SERVER_NAME,
-                "transport": args.transport,
-                "endpoint": endpoint,
-                "hint": f"MCP-URL fuer Clients: http://{args.host}:{args.port}{endpoint}",
-            })
-
-        app.routes.append(Route("/", root, methods=["GET"]))
-
-        url = f"http://{args.host}:{args.port}{endpoint}"
-        logger.info(f"URL: {url}")
-        logger.info("Trage genau diese URL (mit Pfad!) in der llama.cpp WebUI ein.")
-
-        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
-    else:
-        logger.info("Waiting for stdio connection...")
-        mcp.run(transport="stdio")
+    run_mcp_server(
+        mcp=mcp,
+        server_name=SERVER_NAME,
+        host=args.host,
+        port=args.port,
+        transport=args.transport,
+        streamable_http_app_factory=mcp.streamable_http_app,
+        sse_app_factory=mcp.sse_app,
+    )
 
 
 if __name__ == "__main__":

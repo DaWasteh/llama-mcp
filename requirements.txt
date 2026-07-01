@@ -1,7 +1,8 @@
-mcp[cli]>=1.27.1
-pywin32>=311; sys_platform == "win32"
-uvicorn>=0.46.0
-starlette>=1.0.0
-httpx>=0.28.0
-duckduckgo-search>=8.1.1
-beautifulsoup4>=4.14.3
+# Kombinierte Abhaengigkeiten (beide MCP-Server).
+# Die Server sind sauber getrennt - fuer schlanke Installationen stattdessen
+#   requirements-dateisystem.txt      (nur Dateisystem-Server)
+#   requirements-recherche.txt        (nur Internet-Recherche-Server)
+# verwenden. Diese Datei hier installiert beide auf einmal.
+
+-r requirements-dateisystem.txt
+-r requirements-recherche.txt

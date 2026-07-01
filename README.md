@@ -1,15 +1,20 @@
-# MCP Filesystem Server für llama.cpp
+# MCP Server für llama.cpp
 
-Ein Model Context Protocol (MCP) Server, der dem LLM über llama.cpp
-Zugriff auf das lokale Dateisystem ermöglicht (Windows, Linux, macOS).
+Zwei **sauber getrennte** Model Context Protocol (MCP) Server für llama.cpp:
 
-> **Sicherheits-Update (Mai 2026)**: Diese Version enthält gehärtete
-> Sicherheits-Patches. Siehe [Abschnitt "Sicherheit"](#sicherheit) für Details.
+| Server | Datei | Port | Zweck |
+|--------|-------|------|------|
+| **Dateisystem-Server** | `lokales_dateisystem.py` | `8765` | Zugriff auf das lokale Dateisystem (Windows/Linux/macOS) |
+| **Internet-Recherche-Server** | `internet_recherche.py` | `8766` | Sichere Web-Recherche (DuckDuckGo, Wikipedia, arXiv, GESTI) |
 
-## Installation
+Jeder Server läuft als **eigener Prozess** mit eigenem Start-Skript. Sie importieren nur ein winziges gemeinsames Bootstrap-Modul ([`server_common.py`](server_common.py)) — sind aber logisch vollständig entkoppelt.
+
+> **Sicherheits-Updates:** Die Dateisystem-Härtung (Mai 2026) siehe [Sicherheit](#sicherheit). Die Internet-Recherche-Härtung (Juli 2026) siehe [`README_internet_recherche.md`](README_internet_recherche.md).
+
+## Schnellstart
 
 1. Python 3.12+ installieren
-2. Python-Umgebung einrichten:
+2. Virtuelle Umgebung einrichten:
 
    ```bat
    python -m venv .venv
@@ -18,11 +23,29 @@ Zugriff auf das lokale Dateisystem ermöglicht (Windows, Linux, macOS).
    pip install -r requirements.txt
    ```
 
-3. `run_server.bat` ausführen oder direkt starten:
+3. **Gewünschten Server starten** (jedes Skript richtet das venv automatisch ein):
 
-    ```bat
-    python lokales_dateisystem.py --host 127.0.0.1 --port 8765 --transport streamable-http
-    ```
+   | Skript | Startet | URL für llama.cpp WebUI |
+   |--------|---------|------------------------|
+   | `server_dateisystem.bat` | Dateisystem-Server | `http://127.0.0.1:8765/mcp` |
+   | `server_recherche.bat` | Internet-Recherche-Server | `http://127.0.0.1:8766/mcp` |
+
+   Alternativ direkt:
+
+   ```bat
+   python lokales_dateisystem.py --host 127.0.0.1 --port 8765 --transport streamable-http
+   python internet_recherche.py --host 127.0.0.1 --port 8766 --transport streamable-http
+   ```
+
+> **Hinweis:** Beide Server können **gleichzeitig** laufen (unterschiedliche Ports). Trage die jeweilige `/mcp`-URL (mit Pfad!) in der llama.cpp WebUI ein.
+
+## Abhängigkeiten (schlank)
+
+Für minimale Installationen gibt es zwei Requirements-Dateien — installiere nur das, was du brauchst:
+
+- [`requirements-dateisystem.txt`](requirements-dateisystem.txt) — nur Dateisystem-Server (kein `duckduckgo-search`/`beautifulsoup4` nötig)
+- [`requirements-recherche.txt`](requirements-recherche.txt) — nur Internet-Recherche-Server
+- [`requirements.txt`](requirements.txt) — beide auf einmal
 
 ## Verfügbare Tools
 
@@ -96,7 +119,11 @@ Zugriff auf das lokale Dateisystem ermöglicht (Windows, Linux, macOS).
 | create_symlink   | Symbolischen Link erstellen           | `path`, `target`, `is_directory=False` |
 | resolve_symlink  | Symlink auflösen und Ziel anzeigen    | `path`                                 |
 
-### Internet-Recherche (optional)
+### Internet-Recherche (eigener Server!)
+
+Die Internet-Recherche-Tools laufen auf einem **eigenen Server** (`internet_recherche.py`, Port 8766),
+**NICHT** auf dem Dateisystem-Server. Siehe [`README_internet_recherche.md`](README_internet_recherche.md)
+für die vollständige Doku und Sicherheitsfeatures.
 
 | Tool                       | Beschreibung                                     |
 |----------------------------|--------------------------------------------------|
@@ -108,11 +135,11 @@ Zugriff auf das lokale Dateisystem ermöglicht (Windows, Linux, macOS).
 | search_gesti               | Gefahrstoffdaten suchen                          |
 | safe_web_scrape            | Sicheres Scraping beliebiger Webseiten           |
 
-> **Hinweis:** Internet-Recherche-Tools sind nur verfügbar, wenn `duckduckgo-search` und `beautifulsoup4` installiert sind. Siehe [`README_internet_recherche.md`](README_internet_recherche.md) für Details.
+Start: `server_recherche.bat` oder `python internet_recherche.py --port 8766`.
 
 ## Sicherheit
 
-Diese Version enthält die folgenden Härtungen gegenüber der Erstversion:
+Der Dateisystem-Server enthält die folgenden Härtungen gegenüber der Erstversion:
 
 ### Kritische Schutzmaßnahmen
 
@@ -153,7 +180,7 @@ python lokales_dateisystem.py --host 127.0.0.1 --port 8765
 ### Bekannte Einschränkungen / nicht behoben
 
 - **TOCTOU-Race**: Zwischen `is_path_safe` und der eigentlichen Datei-Operation könnte ein lokaler Angreifer theoretisch einen Symlink unterschieben. Auf Single-User-Systemen (typischer llama.cpp-Use-Case) ist das kein realistisches Risiko; Mitigation per File-Descriptor-basierter API (`openat`) wurde wegen Portabilitäts-Verlust nicht umgesetzt.
-- **Keine eingebaute Authentifizierung**: Der MCP-Server hat keine Auth-Schicht; das ist im aktuellen MCP-Protokoll auch nicht standardisiert. Schutz erfolgt ausschließlich über das Binding auf `127.0.0.1` (Default) und CORS.
+- **Keine eingebaute Authentifizierung**: Beide MCP-Server haben keine Auth-Schicht; das ist im aktuellen MCP-Protokoll auch nicht standardisiert. Schutz erfolgt ausschließlich über das Binding auf `127.0.0.1` (Default) und CORS.
 - **chmod_file mit max. 0o755**: Wer 0o775 (Gruppe schreiben) oder 0o770 benötigt, kommt mit dieser Restriktion nicht durch. Begründung: Risiko durch LLM-Fehlsteuerung höher als Nutzen.
 
 ## Transport-Modi
@@ -168,8 +195,9 @@ python lokales_dateisystem.py --host 127.0.0.1 --port 8765
 
 Der Server nutzt UTF-8-Codierung für Eingabe/Ausgabe. Bei Problemen mit Umlauten bitte sicherstellen, dass die Umgebungsvariablen `PYTHONUTF8=1` und `PYTHONIOENCODING=utf-8` gesetzt sind.
 
-## Beispiel-URL
+## Beispiel-URLs
 
 ```
-http://127.0.0.1:8765/mcp
+Dateisystem-Server:   http://127.0.0.1:8765/mcp
+Internet-Recherche:    http://127.0.0.1:8766/mcp
 ```

@@ -3,13 +3,12 @@ REM UTF-8 Codepage fuer Umlaute und Emojis
 chcp 65001 >nul
 setlocal enabledelayedexpansion
 
-REM Python soll stdin/stdout/stderr in UTF-8 nutzen
-
 REM Ins Skript-Verzeichnis wechseln
 cd /d "%~dp0"
 
 echo ========================================
-echo   MCP Filesystem Server fuer llama.cpp
+echo   MCP Dateisystem-Server fuer llama.cpp
+echo   Port 8765  -  http://127.0.0.1:8765/mcp
 echo ========================================
 echo.
 
@@ -39,12 +38,12 @@ if errorlevel 1 (
 )
 
 REM ---------- [3/3] Abhaengigkeiten ----------
-echo [3/3] Installiere Abhaengigkeiten...
+echo [3/3] Installiere Abhaengigkeiten (Dateisystem)...
 python -m pip install --upgrade pip >nul 2>&1
-if exist "requirements.txt" (
-    python -m pip install -r requirements.txt
+if exist "requirements-dateisystem.txt" (
+    python -m pip install -r requirements-dateisystem.txt
 ) else (
-    python -m pip install "mcp[cli]" pywin32
+    python -m pip install "mcp[cli]" pywin32 uvicorn starlette
 )
 if errorlevel 1 (
     echo.
@@ -55,13 +54,12 @@ if errorlevel 1 (
 
 echo.
 echo ========================================
-echo   Server wird gestartet (HTTP Transport)
-echo ========================================
+echo   Dateisystem-Server wird gestartet
 echo   STRG+C zum Beenden
 echo ========================================
 echo.
 
-REM Server starten - Standard: streamable-http auf 127.0.0.1:8765
+REM Server starten - streamable-http auf 127.0.0.1:8765
 REM URL fuer llama.cpp WebUI: http://127.0.0.1:8765/mcp
 python lokales_dateisystem.py --host 127.0.0.1 --port 8765 --transport streamable-http
 

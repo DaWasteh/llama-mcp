@@ -34,10 +34,10 @@ jobs:
         pip install ruff mypy pyright
 
     - name: Ruff - Lint
-      run: ruff check internet_recherche.py lokales_dateisystem.py
+      run: ruff check internet_recherche.py lokales_dateisystem.py server_common.py
 
     - name: Ruff - Import-Order
-      run: ruff check --select I --diff internet_recherche.py lokales_dateisystem.py
+      run: ruff check --select I --diff internet_recherche.py lokales_dateisystem.py server_common.py
 
     - name: mypy - lokales_dateisystem.py
       run: python -m mypy lokales_dateisystem.py --no-error-summary
@@ -45,16 +45,23 @@ jobs:
     - name: mypy - internet_recherche.py
       run: python -m mypy internet_recherche.py --no-error-summary
 
+    - name: mypy - server_common.py
+      run: python -m mypy server_common.py --no-error-summary
+
     - name: Pyright (Pylance-Engine) - lokales_dateisystem.py
       run: pyright lokales_dateisystem.py
 
     - name: Pyright (Pylance-Engine) - internet_recherche.py
       run: pyright internet_recherche.py
 
+    - name: Pyright (Pylance-Engine) - server_common.py
+      run: pyright server_common.py
+
     - name: Syntax-Pruefung
       run: |
         python -c "import py_compile; py_compile.compile('lokales_dateisystem.py', doraise=True)"
         python -c "import py_compile; py_compile.compile('internet_recherche.py', doraise=True)"
+        python -c "import py_compile; py_compile.compile('server_common.py', doraise=True)"
 
 # ──────────────────────────────────────────────────────────────
 # Job 2: Tests (alle OS x alle Python-Versionen)

@@ -1,0 +1,9 @@
+# Abhaengigkeiten fuer den Internet-Recherche-MCP-Server (internet_recherche.py)
+# Eigenstaendiger Server - kein Dateisystem-Zugriff, keine Schreibzugriffe ins Netz.
+
+mcp[cli]>=1.27.1
+uvicorn>=0.46.0
+starlette>=1.0.0
+httpx>=0.28.0
+duckduckgo-search>=8.1.1
+beautifulsoup4>=4.14.3
