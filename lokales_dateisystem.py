@@ -1671,6 +1671,34 @@ def get_allowed_roots() -> dict:
 
 
 @mcp.tool()
+def get_server_status() -> dict:
+    """Zeigt Status, Limits und Konfiguration des Dateisystem-Servers.
+
+    Pendant zu get_server_status auf dem Recherche-Server: macht die
+    aktiven Sicherheitslimits fuer den LLM-Client transparent, damit er
+    Ablehnungen (z.B. zu grosse Dateien) einordnen kann.
+    """
+    return {
+        "success": True,
+        "server": SERVER_NAME,
+        "system": platform.system(),
+        "default_root": DEFAULT_ROOT,
+        "allowed_roots": ALLOWED_ROOTS,
+        "limits": {
+            "max_file_read_size_bytes": MAX_FILE_READ_SIZE,
+            "max_file_write_size_bytes": MAX_FILE_WRITE_SIZE,
+            "max_recursive_entries": MAX_RECURSIVE_ENTRIES,
+            "max_tree_entries": MAX_TREE_ENTRIES,
+            "max_zip_total_size_bytes": MAX_ZIP_TOTAL_SIZE,
+            "max_zip_files": MAX_ZIP_FILES,
+            "max_content_search_file_size_bytes": MAX_CONTENT_SEARCH_FILE_SIZE,
+            "max_replace_file_size_bytes": MAX_REPLACE_FILE_SIZE,
+        },
+        "blocked_paths_count": len(BLOCKED_PATHS),
+    }
+
+
+@mcp.tool()
 def get_working_directory() -> dict:
     """Gibt das aktuelle Arbeitsverzeichnis und Systeminformationen zurueck."""
     return {

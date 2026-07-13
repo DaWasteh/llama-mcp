@@ -34,6 +34,29 @@ Server-Split & Security-Haertung (Juli 2026):
 - [HOCH] URL-Userinfo (http://user:pass@host) blockiert (Daten-Exfiltration)
 - [HOCH] Erweiterte Blockliste: .onion/.i2p/.localhost, weitere Paste-/File-Hoster
 - [HOCH] Content-Disposition: attachment mit gefaehrlicher Endung blockiert
+
+v0.9 Security-Fixes (Juli 2026):
+- [KRIT] Echter Peer-IP-Check: die tatsaechlich verbundene Server-IP wird
+         geprueft (network_stream), nicht mehr nur der URL-Host - schliesst
+         das DNS-Rebinding-TOCTOU-Fenster zwischen eigener DNS-Pruefung und
+         httpx' eigener Aufloesung
+- [KRIT] Streaming-Read mit hartem Byte-Cap: Abbruch SOBALD das Groessenlimit
+         ueberschritten wird, statt den kompletten Body in den RAM zu laden
+         (Memory-DoS) + Content-Length-Vorabpruefung
+- [HOCH] Sichere manuelle Redirect-Verfolgung (max 3 Hops, jeder Hop laeuft
+         durch die volle URL-/DNS-/Peer-IP-Validierung); vorher scheiterten
+         http->https-Redirects einfach
+- [HOCH] Nur 2xx-Status akzeptiert (vorher wurden 4xx/5xx-Bodies geliefert)
+- [HOCH] Hostname-basierte Domain-Checks statt Substring-Match: GESTI-Filter
+         und Wikipedia/arXiv-Routing waren via gesti.bgba.de.evil.com bzw.
+         evil.com/wikipedia.org spoofbar
+- [HOCH] Rate-Limiter prozessweit geteilt (war pro Thread -> pro Worker
+         eigenes Kontingent, faktisch wirkungslos bei parallelen Sessions)
+- [MITT] XML-Guard gegen DOCTYPE/ENTITY (Billion-Laughs) beim arXiv-Parsing
+- [MITT] Content-Disposition: Endungs-Check auf den Dateinamen statt Substring
+         (".sh" matchte faelschlich ".shtml")
+- [NEU]  Tools: check_url_safety (erklaert Blockgruende ohne Request),
+         get_server_status (Limits/Quellen/Rate-Limit-Restkontingent)
 """
 
 import contextlib
@@ -91,6 +114,7 @@ MAX_HTML_PARSE_SIZE = 200_000  # 200 KB - separate Grenze fuer BeautifulSoup
 REQUESTS_PER_WINDOW = 30  # Rate Limiting: Anfragen pro Zeitfenster
 WINDOW_SECONDS = 60  # Rate Limiting: Zeitfenster in Sekunden
 DNS_CACHE_SECONDS = 30  # Wie lange ein bestaetigter Hostname als "frisch" gilt
+MAX_REDIRECTS = 3  # Manuell verfolgte Redirects (jeder Hop wird neu validiert)
 
 ALLOWED_SCHEMAS = {"http", "https"}
 
@@ -129,10 +153,13 @@ BLOCKED_DOMAIN_SUFFIXES = (
 )
 
 # Blockierte URL-Endungen (Downloads/Executables)
+# HINWEIS: .php gehoert NICHT hierher - server-seitige Scripts liefern
+# gerendertes HTML/JSON (der Block machte u.a. die Wikipedia-API
+# /w/api.php unbenutzbar). Binaries faengt der Content-Type-Check ab.
 BLOCKED_EXTENSIONS = {
     ".exe", ".dll", ".so", ".msi", ".bat", ".cmd", ".ps1", ".sh", ".bash",
     ".zsh", ".com", ".scr", ".pif", ".vbs", ".js", ".jar", ".app", ".dmg",
-    ".iso", ".img", ".py", ".pl", ".rb", ".php", ".bin", ".elf", ".out",
+    ".iso", ".img", ".py", ".pl", ".rb", ".bin", ".elf", ".out",
 }
 
 ALLOWED_SOURCES = {"duckduckgo", "wikipedia", "arxiv", "gesti"}
@@ -367,10 +394,24 @@ class RateLimiter:
             self.requests.append(now)
             return True
 
+    def remaining(self) -> int:
+        """Anzahl aktuell noch erlaubter Anfragen im Zeitfenster (ohne zu tracken)."""
+        now = time()
+        with self._lock:
+            while self.requests and self.requests[0] < now - self.window_seconds:
+                self.requests.popleft()
+            return max(0, self.max_requests - len(self.requests))
+
     def reset(self) -> None:
         """Setzt das Rate-Limit zurueck."""
         with self._lock:
             self.requests.clear()
+
+
+# Prozessweiter Rate-Limiter: Die Engine ist thread-lokal, das Limit darf es
+# NICHT sein - sonst bekommt jeder HTTP-Worker-Thread sein eigenes Kontingent
+# und das Limit ist bei parallelen Sessions faktisch wirkungslos.
+_GLOBAL_RATE_LIMITER = RateLimiter()
 
 
 # Globale Patterns - kompiliert beim Import fuer Performance
@@ -506,6 +547,90 @@ def sanitize_for_prompt(text: str) -> str:
     return text
 
 
+def safe_parse_xml(xml_text: str):
+    """Parst XML mit Schutz gegen Entity-Angriffe (Billion Laughs / XXE).
+
+    DOCTYPE- und ENTITY-Deklarationen werden hart abgelehnt - die von uns
+    genutzten APIs (arXiv Atom) verwenden keine. Liefert Element oder None.
+    """
+    if not xml_text:
+        return None
+    head = xml_text[:4096].lower()
+    if "<!doctype" in head or "<!entity" in head:
+        logger.warning("XML mit DOCTYPE/ENTITY-Deklaration blockiert")
+        return None
+    from xml.etree import ElementTree
+    try:
+        return ElementTree.fromstring(xml_text)
+    except ElementTree.ParseError as e:
+        logger.warning(f"XML-Parse-Fehler: {e}")
+        return None
+
+
+def explain_url_block(url: str) -> list[str]:
+    """Erklaert, WARUM eine URL blockiert wird (leere Liste = URL ist ok).
+
+    Rein diagnostisch - fuehrt KEINEN HTTP-Request aus. Prueft dieselben
+    Regeln wie is_safe_url plus DNS-Aufloesung.
+    """
+    reasons: list[str] = []
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return ["URL konnte nicht geparst werden"]
+
+    if "\x00" in url:
+        reasons.append("URL enthaelt Null-Byte")
+    if parsed.scheme not in ALLOWED_SCHEMAS:
+        reasons.append(f"Schema '{parsed.scheme}' nicht erlaubt (nur http/https)")
+    if not parsed.hostname:
+        reasons.append("Kein Hostname in der URL")
+        return reasons
+    if parsed.username or parsed.password:
+        reasons.append("Userinfo (user:pass@) in URL blockiert (Exfiltrations-Vektor)")
+
+    hostname = parsed.hostname.lower().rstrip(".")
+    if hostname in ("localhost", "0.0.0.0", "127.0.0.1", "::1", "ip6-localhost", "ip6-loopback"):
+        reasons.append("Localhost/interner Hostname blockiert")
+    if _is_ip_literal(hostname) and is_private_ip(hostname):
+        reasons.append("Private/reservierte IP-Adresse blockiert")
+    decoded = _decode_ip_hostname(hostname)
+    if decoded is not None and is_private_ip(decoded):
+        reasons.append(f"Codierte private IP erkannt ({hostname} -> {decoded})")
+    for blocked in BLOCKED_DOMAINS:
+        if hostname == blocked or hostname.endswith("." + blocked):
+            reasons.append(f"Domain auf Blockliste: {blocked}")
+            break
+    for suffix in BLOCKED_DOMAIN_SUFFIXES:
+        if hostname.endswith(suffix):
+            reasons.append(f"Blockiertes Domain-Suffix: {suffix}")
+            break
+    path_lower = parsed.path.lower()
+    for ext in BLOCKED_EXTENSIONS:
+        if path_lower.endswith(ext):
+            reasons.append(f"Blockierte Datei-Endung: {ext}")
+            break
+
+    # DNS nur pruefen, wenn bis hierhin nichts dagegen spricht
+    if not reasons and not resolve_and_verify(hostname):
+        reasons.append("DNS-Aufloesung fehlgeschlagen oder zeigt auf private IP")
+    return reasons
+
+
+def _hostname_matches(url: str, domain: str) -> bool:
+    """Prueft hostname-basiert (kein Substring-Match!), ob url zu domain gehoert.
+
+    Verhindert Spoofing wie https://gesti.bgba.de.evil.com/ oder
+    https://evil.com/wikipedia.org, das ein "domain in url" durchlassen wuerde.
+    """
+    try:
+        hostname = (urlparse(url).hostname or "").lower().rstrip(".")
+        domain = domain.lower()
+        return hostname == domain or hostname.endswith("." + domain)
+    except Exception:
+        return False
+
+
 def is_safe_link(link: str, current_domain: str) -> bool:
     """Prueft, ob ein Link sicher zum Folgen ist."""
     if not is_safe_url(link):
@@ -586,41 +711,134 @@ class SafeHttpClient:
 
         # Attachment-Download mit gefaehrlicher Endung blocken (Malware-Vektor)
         disposition = response.headers.get("content-disposition", "").lower()
-        if "attachment" in disposition and any(ext in disposition for ext in BLOCKED_EXTENSIONS):
-            logger.warning(f"Attachment mit gefaehrlicher Endung blockiert: {self._sanitize_url_for_logging(url)}")
-            return False
+        if "attachment" in disposition:
+            fname_match = re.search(r"filename\*?\s*=\s*[\"']?([^\"';]+)", disposition)
+            filename = fname_match.group(1).strip() if fname_match else disposition
+            if any(filename.endswith(ext) for ext in BLOCKED_EXTENSIONS):
+                logger.warning(f"Attachment mit gefaehrlicher Endung blockiert: {self._sanitize_url_for_logging(url)}")
+                return False
         return True
 
-    def _safe_get(self, url: str, params=None, headers=None, max_size: int = MAX_RESPONSE_SIZE):
-        """GET mit allen Sicherheitschecks. Liefert httpx.Response oder None."""
-        if not is_safe_url(url):
-            logger.warning(f"Blockierte unsichere URL: {self._sanitize_url_for_logging(url)}")
-            return None
+    @staticmethod
+    def _get_peer_ip(response) -> str | None:
+        """Liest die tatsaechlich verbundene Server-IP aus der Response.
 
-        hostname = (urlparse(url).hostname or "").lower()
-
-        # DNS-Rebinding-Schutz: Frische Validierung pro Request
-        if not self._verify_host_fresh(hostname):
-            logger.warning(f"DNS-Validierung fehlgeschlagen: {self._sanitize_url_for_logging(url)}")
-            return None
-
+        Das ist der echte DNS-Rebinding-Schutz: httpx loest DNS unabhaengig
+        von resolve_and_verify() auf - nur die Peer-IP der offenen Verbindung
+        beweist, wohin wirklich verbunden wurde.
+        """
         try:
-            response = self.session.get(url, params=params, headers=headers)
-            if not self._check_response(response, url, max_size):
+            stream = response.extensions.get("network_stream")
+            if stream is None:
                 return None
-            return response
-        except httpx.TimeoutException:
-            logger.warning(f"Timeout bei {self._sanitize_url_for_logging(url)}")
-            return None
-        except httpx.InvalidURL:
-            logger.warning(f"Ungueltige URL: {self._sanitize_url_for_logging(url)}")
-            return None
-        except httpx.TooManyRedirects:
-            logger.warning(f"Zu viele Redirects: {self._sanitize_url_for_logging(url)}")
-            return None
+            addr = stream.get_extra_info("server_addr")
+            if addr:
+                ip_str = str(addr[0])
+                if "%" in ip_str:  # IPv6 Zone-ID abschneiden
+                    ip_str = ip_str.split("%", 1)[0]
+                return ip_str
         except Exception:
-            logger.warning(f"Fehler bei {self._sanitize_url_for_logging(url)}: [interner Fehler]")
             return None
+        return None
+
+    @staticmethod
+    def _read_capped(response, max_size: int) -> bytes | None:
+        """Liest den Response-Body streamend mit hartem Byte-Limit.
+
+        Verhindert Memory-DoS: Abbruch SOBALD max_size ueberschritten wird,
+        statt erst den kompletten Body in den RAM zu laden.
+        """
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in response.iter_bytes(chunk_size=65536):
+            total += len(chunk)
+            if total > max_size:
+                return None
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    _REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+
+    def _safe_get(self, url: str, params=None, headers=None, max_size: int = MAX_RESPONSE_SIZE):
+        """GET mit allen Sicherheitschecks. Liefert httpx.Response oder None.
+
+        Sicherheitspipeline pro Hop (Redirects werden MANUELL verfolgt,
+        damit jeder Hop die volle Validierung durchlaeuft):
+          1. is_safe_url (Schema/Domain/IP-Encoding/Blocklisten)
+          2. DNS-Validierung (alle A/AAAA-Eintraege oeffentlich)
+          3. Peer-IP der echten Verbindung pruefen (Rebinding-Schutz)
+          4. Nur 2xx-Status akzeptieren
+          5. Content-Length-Vorabpruefung + gecappter Streaming-Read
+          6. _check_response (Content-Type, Disposition, Groesse)
+        """
+        for _hop in range(MAX_REDIRECTS + 1):
+            if not is_safe_url(url):
+                logger.warning(f"Blockierte unsichere URL: {self._sanitize_url_for_logging(url)}")
+                return None
+
+            hostname = (urlparse(url).hostname or "").lower()
+
+            # DNS-Rebinding-Schutz: Frische Validierung pro Request
+            if not self._verify_host_fresh(hostname):
+                logger.warning(f"DNS-Validierung fehlgeschlagen: {self._sanitize_url_for_logging(url)}")
+                return None
+
+            try:
+                with self.session.stream("GET", url, params=params, headers=headers) as response:
+                    # Echte Peer-IP der Verbindung pruefen (nicht nur URL-Host)
+                    peer_ip = self._get_peer_ip(response)
+                    if peer_ip and is_private_ip(peer_ip):
+                        logger.warning(f"Verbindung zu privater IP blockiert: {peer_ip}")
+                        return None
+
+                    # Redirects manuell verfolgen - jeder Hop neu validiert
+                    if response.status_code in self._REDIRECT_CODES:
+                        location = response.headers.get("location", "")
+                        if not location:
+                            return None
+                        url = urljoin(url, location)
+                        params = None  # Query steckt ab jetzt in der Redirect-URL
+                        continue
+
+                    if not (200 <= response.status_code < 300):
+                        logger.warning(
+                            f"HTTP {response.status_code} bei {self._sanitize_url_for_logging(url)}"
+                        )
+                        return None
+
+                    # Content-Length-Vorabpruefung (frueher Abbruch)
+                    content_length = response.headers.get("content-length", "")
+                    if content_length.isdigit() and int(content_length) > max_size:
+                        logger.warning(f"Content-Length zu gross: {content_length} bytes")
+                        return None
+
+                    body = self._read_capped(response, max_size)
+                    if body is None:
+                        logger.warning(f"Response zu gross (Stream-Abbruch): {self._sanitize_url_for_logging(url)}")
+                        return None
+
+                    # Body am Response-Objekt hinterlegen, damit .content/.text/
+                    # .json() wie gewohnt funktionieren (httpx-Konvention).
+                    response._content = body
+
+                if not self._check_response(response, url, max_size):
+                    return None
+                return response
+            except httpx.TimeoutException:
+                logger.warning(f"Timeout bei {self._sanitize_url_for_logging(url)}")
+                return None
+            except httpx.InvalidURL:
+                logger.warning(f"Ungueltige URL: {self._sanitize_url_for_logging(url)}")
+                return None
+            except httpx.TooManyRedirects:
+                logger.warning(f"Zu viele Redirects: {self._sanitize_url_for_logging(url)}")
+                return None
+            except Exception:
+                logger.warning(f"Fehler bei {self._sanitize_url_for_logging(url)}: [interner Fehler]")
+                return None
+
+        logger.warning(f"Redirect-Limit ({MAX_REDIRECTS}) erreicht: {self._sanitize_url_for_logging(url)}")
+        return None
 
     def fetch(self, url: str, *, params=None, headers=None, max_size: int = MAX_RESPONSE_SIZE) -> str | None:
         """Sichert eine URL mit Groessenlimit und DNS-Rebinding-Schutz (Text)."""
@@ -795,8 +1013,9 @@ class ArXivSearcher:
             })
             if not xml_text:
                 return results
-            from xml.etree import ElementTree
-            root = ElementTree.fromstring(xml_text)
+            root = safe_parse_xml(xml_text)
+            if root is None:
+                return results
             namespace = {
                 "atom": "http://www.w3.org/2005/Atom",
                 "opensearch": "http://a9.com/-/spec/opensearch/1.1/",
@@ -840,8 +1059,9 @@ class ArXivSearcher:
             })
             if not xml_text:
                 return None
-            from xml.etree import ElementTree
-            root = ElementTree.fromstring(xml_text)
+            root = safe_parse_xml(xml_text)
+            if root is None:
+                return None
             namespace = {"atom": "http://www.w3.org/2005/Atom"}
             for entry in root.findall(".//atom:entry", namespace):
                 title = (entry.findtext("atom:title", "") or "").strip().replace("\n", " ")
@@ -895,7 +1115,9 @@ class GESTISearcher:
             ddgs = DDGS()
             for result in ddgs.text(f"site:gesti.bgba.de {query}", max_results=max_results):
                 url = result.get("href", "")
-                if "gesti.bgba.de" in url and is_safe_url(url):
+                # Hostname-Check statt Substring: verhindert Spoofing via
+                # https://gesti.bgba.de.evil.com/ oder Pfad-Tricks.
+                if _hostname_matches(url, "gesti.bgba.de") and is_safe_url(url):
                     results.append(SearchResult(
                         title=result.get("title", ""), url=url,
                         snippet=result.get("body", ""), source="gesti",
@@ -992,7 +1214,7 @@ class InternetResearchEngine:
         self.gesti = GESTISearcher()
         self.github = GitHubSearcher(self.http_client)
         self.news = NewsSearcher()
-        self.rate_limiter = RateLimiter()
+        self.rate_limiter = _GLOBAL_RATE_LIMITER  # geteilt ueber alle Threads
         self._visited_urls: set[str] = set()
         self._page_count = 0
         self._state_lock = threading.Lock()
@@ -1198,9 +1420,9 @@ class InternetResearchEngine:
             self._visited_urls.add(url)
             self._page_count += 1
 
-        if "wikipedia.org" in url:
+        if _hostname_matches(url, "wikipedia.org"):
             return self.wiki.get_article(url)
-        if "arxiv.org" in url:
+        if _hostname_matches(url, "arxiv.org"):
             arxiv_id = urlsplit_id(url)
             if arxiv_id:
                 page = self.arxiv.get_paper_details(url)
@@ -1557,6 +1779,60 @@ def _register_tools_to_server(mcp_server):
         except Exception as e:
             logger.error(f"safe_web_scrape interner Fehler: {e!s}")
             return {"success": False, "error": "Ein interner Fehler ist aufgetreten", "url": url}
+
+    @tool_dec()
+    def check_url_safety(url: str) -> dict:
+        """Prueft OHNE Request, ob eine URL erlaubt waere - und warum nicht.
+
+        Nuetzlich um vorab zu verstehen, warum read_webpage/safe_web_scrape
+        eine URL ablehnen wuerde (Blockliste, private IP, Endung, DNS, ...).
+
+        Args:
+            url: Zu pruefende URL (http/https).
+        """
+        try:
+            reasons = explain_url_block(url)
+            return {
+                "success": True,
+                "url": url,
+                "allowed": not reasons,
+                "block_reasons": reasons,
+            }
+        except Exception as e:
+            logger.error(f"check_url_safety interner Fehler: {e!s}")
+            return {"success": False, "error": "Ein interner Fehler ist aufgetreten", "url": url}
+
+    @tool_dec()
+    def get_server_status() -> dict:
+        """Zeigt Status, Limits und erlaubte Quellen des Recherche-Servers.
+
+        Verbraucht KEIN Rate-Limit-Kontingent. Pendant zu get_allowed_roots
+        auf dem Dateisystem-Server.
+        """
+        try:
+            return {
+                "success": True,
+                "server": RESEARCH_SERVER_NAME,
+                "allowed_sources": [*sorted(ALLOWED_SOURCES), "github", "news"],
+                "rate_limit": {
+                    "max_requests": REQUESTS_PER_WINDOW,
+                    "window_seconds": WINDOW_SECONDS,
+                    "remaining": _GLOBAL_RATE_LIMITER.remaining(),
+                },
+                "limits": {
+                    "max_pages_per_search": MAX_PAGES_PER_SEARCH,
+                    "max_search_results": MAX_SEARCH_RESULTS,
+                    "max_result_length": MAX_RESULT_LENGTH,
+                    "max_response_size_bytes": MAX_RESPONSE_SIZE,
+                    "max_redirects": MAX_REDIRECTS,
+                    "http_timeout_seconds": HTTP_TIMEOUT,
+                },
+                "blocked_domains_count": len(BLOCKED_DOMAINS),
+                "blocked_extensions_count": len(BLOCKED_EXTENSIONS),
+            }
+        except Exception as e:
+            logger.error(f"get_server_status interner Fehler: {e!s}")
+            return {"success": False, "error": "Ein interner Fehler ist aufgetreten"}
 
 
 # Registriere Tools auf dem research-spezifischen Server
