@@ -2,7 +2,8 @@
 # Diese Datei installiert NUR das, was der Dateisystem-Server braucht -
 # die Internet-Recherche ist ein eigenstaendiger Server (siehe requirements-recherche.txt).
 
-mcp[cli]>=1.27.1
+# MCP 2.x removed the mcp.server.fastmcp import used by this server.
+mcp[cli]==1.29.0
 uvicorn>=0.46.0
 starlette>=1.0.0
 pywin32>=311; sys_platform == "win32"

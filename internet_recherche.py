@@ -81,6 +81,7 @@ try:
     from mcp.server.fastmcp import FastMCP
 except ImportError as e:
     print(f"FEHLER: MCP SDK nicht installiert. ({e})", file=sys.stderr)
+    print('Fuehre aus: python -m pip install "mcp[cli]==1.29.0"', file=sys.stderr)
     raise
 
 try:

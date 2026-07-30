@@ -43,7 +43,7 @@ python -m pip install --upgrade pip >nul 2>&1
 if exist "requirements-dateisystem.txt" (
     python -m pip install -r requirements-dateisystem.txt
 ) else (
-    python -m pip install "mcp[cli]" pywin32 uvicorn starlette
+    python -m pip install "mcp[cli]==1.29.0" pywin32 uvicorn starlette
 )
 if errorlevel 1 (
     echo.
