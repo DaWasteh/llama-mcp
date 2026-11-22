@@ -1,10 +1,9 @@
 # Abhaengigkeiten fuer den Internet-Recherche-MCP-Server (internet_recherche.py)
-# Eigenstaendiger Server - kein Dateisystem-Zugriff, keine Schreibzugriffe ins Netz.
 
 # MCP 2.x removed the mcp.server.fastmcp import used by this server.
 mcp[cli]==1.29.0
 uvicorn>=0.46.0
 starlette>=1.0.0
 httpx>=0.28.0
-duckduckgo-search>=8.1.1
+ddgs>=9.0.0
 beautifulsoup4>=4.14.3

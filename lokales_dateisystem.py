@@ -1,19 +1,14 @@
 """
-MCP Server für lokalen Dateisystem-Zugriff (Windows/Linux/macOS).
+MCP-Server fuer sicheren lokalen Dateisystem-Zugriff (Windows/Linux/macOS, Port 8765).
 
 Kompatibel mit llama.cpp WebUI via Streamable HTTP Transport.
 
-Sicherheits-Patches (Mai 2026):
-- [KRIT] Symlink-Ziel-Validierung (realpath) in is_path_safe()
-- [KRIT] ZIP-Slip-Schutz in decompress_archive()
-- [KRIT] ZIP-Bomb-Schutz (Decompression-Ratio + Total-Size-Limit)
-- [HOCH] Eintragslimits fuer rekursive Operationen (list_directory, get_tree, count_entries, ...)
-- [HOCH] CORS jetzt per Umgebungsvariable konfigurierbar (statt "*")
-- [HOCH] Dateigroessen-Limit fuer read_file/write_file
-- [HOCH] chmod restriktiv: keine setuid/setgid/world-writable
-- [HOCH] Null-Byte-Schutz fuer alle Pfad-Eingaben
-- [MITT] write_file_binary mit Base64-Decode-Limit
-- [MITT] Loggen sicherheitsrelevanter Ereignisse
+Sicherheitsmaßnahmen:
+- Symlink-Ziel-Validierung (realpath) und blockierte Systempfade in is_path_safe()
+- ZIP-Slip-, Symlink- und ZIP-Bomb-Schutz in decompress_archive()
+- Datei- und Eintrags-Limits gegen DoS (50 MB Datei-Limit, max. 10 000 rekursive Eintraege)
+- Restriktives chmod (max. 0o755, kein setuid/setgid/world-writable), Null-Byte-Schutz
+- Restriktive CORS-Defaults (konfigurierbar via MCP_ALLOWED_ORIGINS)
 """
 
 import base64

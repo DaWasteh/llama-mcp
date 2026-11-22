@@ -1,19 +1,17 @@
-# MCP Server für llama.cpp
+# MCP-Server für llama.cpp
 
-Zwei **sauber getrennte** Model Context Protocol (MCP) Server für llama.cpp:
+Zwei eigenständige Model Context Protocol (MCP) Server für die llama.cpp WebUI:
 
 | Server | Datei | Port | Zweck |
-|--------|-------|------|------|
-| **Dateisystem-Server** | `lokales_dateisystem.py` | `8765` | Zugriff auf das lokale Dateisystem (Windows/Linux/macOS) |
-| **Internet-Recherche-Server** | `internet_recherche.py` | `8766` | Sichere Web-Recherche (DuckDuckGo, Wikipedia, arXiv, GESTI) |
+|--------|-------|------|-------|
+| **Dateisystem-Server** | [`lokales_dateisystem.py`](lokales_dateisystem.py) | `8765` | Zugriff auf das lokale Dateisystem (Windows/Linux/macOS) |
+| **Internet-Recherche-Server** | [`internet_recherche.py`](internet_recherche.py) | `8766` | Sichere Web-Recherche (DuckDuckGo, Wikipedia, arXiv, GESTIS, GitHub, News, Wayback) |
 
-Jeder Server läuft als **eigener Prozess** mit eigenem Start-Skript. Sie importieren nur ein winziges gemeinsames Bootstrap-Modul ([`server_common.py`](server_common.py)) — sind aber logisch vollständig entkoppelt.
-
-> **Sicherheits-Updates:** Die Dateisystem-Härtung (Mai 2026) siehe [Sicherheit](#sicherheit). Die Internet-Recherche-Härtung (Juli 2026) siehe [`README_internet_recherche.md`](README_internet_recherche.md).
+Beide Server laufen als getrennte Prozesse ohne gegenseitige Imports und teilen lediglich den HTTP-/CORS-Bootstrap in [`server_common.py`](server_common.py). Details zum Recherche-Server stehen in [`README_internet_recherche.md`](README_internet_recherche.md).
 
 ## Schnellstart
 
-1. Python 3.12+ installieren
+1. Python 3.10+ (empfohlen 3.12+) installieren
 2. Virtuelle Umgebung einrichten:
 
    ```bat
@@ -23,186 +21,132 @@ Jeder Server läuft als **eigener Prozess** mit eigenem Start-Skript. Sie import
    pip install -r requirements.txt
    ```
 
-3. **Gewünschten Server starten** (jedes Skript richtet das venv automatisch ein):
+3. Gewünschten Server starten (unter Windows richten die `.bat`-Skripte das `.venv` automatisch ein):
 
-   | Skript | Startet | URL für llama.cpp WebUI |
-   |--------|---------|------------------------|
+   | Skript | Startet | MCP-URL für llama.cpp WebUI |
+   |--------|---------|-----------------------------|
    | `server_dateisystem.bat` | Dateisystem-Server | `http://127.0.0.1:8765/mcp` |
    | `server_recherche.bat` | Internet-Recherche-Server | `http://127.0.0.1:8766/mcp` |
 
-   Alternativ direkt:
+   Direktstart (Windows/Linux/macOS):
 
-   ```bat
+   ```bash
    python lokales_dateisystem.py --host 127.0.0.1 --port 8765 --transport streamable-http
    python internet_recherche.py --host 127.0.0.1 --port 8766 --transport streamable-http
    ```
 
-> **Hinweis:** Beide Server können **gleichzeitig** laufen (unterschiedliche Ports). Trage die jeweilige `/mcp`-URL (mit Pfad!) in der llama.cpp WebUI ein.
+> Beide Server können parallel laufen. In der llama.cpp WebUI muss die vollständige URL inklusive `/mcp`-Pfad eingetragen werden.
 
-## Abhängigkeiten (schlank)
+## Abhängigkeiten
 
-Für minimale Installationen gibt es zwei Requirements-Dateien — installiere nur das, was du brauchst:
+- [`requirements-dateisystem.txt`](requirements-dateisystem.txt) — nur Dateisystem-Server
+- [`requirements-recherche.txt`](requirements-recherche.txt) — nur Internet-Recherche-Server (`ddgs`, `beautifulsoup4`, `httpx`, …)
+- [`requirements.txt`](requirements.txt) — beide Server zusammen
 
-- [`requirements-dateisystem.txt`](requirements-dateisystem.txt) — nur Dateisystem-Server (kein `duckduckgo-search`/`beautifulsoup4` nötig)
-- [`requirements-recherche.txt`](requirements-recherche.txt) — nur Internet-Recherche-Server
-- [`requirements.txt`](requirements.txt) — beide auf einmal
+## Dateisystem-Tools (`lokales_dateisystem.py`, Port 8765)
 
-## Verfügbare Tools
+### Dateien
 
-### Dateioperationen
+| Tool | Beschreibung | Parameter |
+|------|--------------|-----------|
+| `read_file` | Textdatei lesen (max. 50 MB) | `path` |
+| `read_file_binary` | Binärdatei als Base64 lesen (max. 50 MB) | `path` |
+| `write_file` | Textdatei schreiben oder anhängen (max. 50 MB) | `path`, `content`, `append=False`, `encoding="utf-8"` |
+| `write_file_binary` | Base64-Daten schreiben (max. 50 MB) | `path`, `content`, `encoding="base64"` |
+| `find_replace` | Suchen & Ersetzen (literal/Regex, optional Backup, max. 10 MB) | `path`, `pattern`, `replacement`, `use_regex=False`, `count=0`, `backup=False` |
+| `rename_file` | Datei oder Ordner umbenennen | `path`, `new_name` |
+| `touch_file` | Zeitstempel aktualisieren oder leere Datei anlegen | `path`, `times=None` |
+| `get_file_lines` | Zeilenbereich lesen | `path`, `start=0`, `end=None` |
 
-| Tool                  | Beschreibung                                          | Parameter                                             |
-|-----------------------|-------------------------------------------------------|-------------------------------------------------------|
-| read_file             | Dateiinhalt lesen (max. 50 MB)                        | `path`                                                |
-| read_file_binary      | Datei als Base64-codierte Binärdaten lesen (max. 50 MB)| `path`                                               |
-| write_file            | Datei schreiben / anhängen (max. 50 MB)               | `path`, `content`, `append=False`, `encoding="utf-8"` |
-| write_file_binary     | Binärdaten (Base64) in Datei schreiben (max. 50 MB)   | `path`, `content`, `encoding="base64"`                |
-| find_replace           | Suchen & Ersetzen in Datei (literal/Regex, optional Backup) | `path`, `pattern`, `replacement`, `use_regex=False`, `count=0`, `backup=False` |
-| rename_file           | Datei oder Verzeichnis umbenennen                     | `path`, `new_name`                                    |
-| touch_file            | Zeitstempel aktualisieren oder Datei erstellen        | `path`, `times=None`                                  |
-| get_file_lines        | Zeilenbereich lesen (Start/Ende Zeile)                | `path`, `start=0`, `end=None`                         |
+### Verzeichnisse
 
-### Verzeichnisoperationen
+| Tool | Beschreibung | Parameter |
+|------|--------------|-----------|
+| `list_directory` | Verzeichnis auflisten (max. 10 000 Einträge) | `path`, `recursive=False`, `hidden=False`, `max_entries=10000` |
+| `get_tree` | Verzeichnisbaum (max. 5 000 Einträge, Tiefe 1–10) | `path`, `max_depth=5`, `hidden=False` |
+| `create_directory` | Ordner erstellen | `path`, `parents=True` |
+| `delete_file` | Datei, Ordner oder Symlink löschen (folgt keinen Symlinks) | `path` |
+| `count_entries` | Dateien und Ordner zählen (max. 10 000 rekursiv) | `path`, `recursive=False` |
+| `empty_directory` | Verzeichnis leeren | `path`, `keep_structure=True` |
+| `move_directory` | Verzeichnis verschieben | `source`, `destination` |
 
-| Tool               | Beschreibung                                      | Parameter                                                     |
-|--------------------|---------------------------------------------------|---------------------------------------------------------------|
-| list_directory     | Verzeichnis auflisten (mit hidden/recursiv)       | `path`, `recursive=False`, `hidden=False`, `max_entries=10000`|
-| get_tree           | Verzeichnisbaum (max. 5000 Einträge, Tiefe 1-10)  | `path`, `max_depth=5`, `hidden=False`                         |
-| create_directory   | Ordner erstellen (mit Eltern-Pfaden)              | `path`, `parents=True`                                        |
-| delete_file        | Datei/Ordner löschen (Symlinks werden NICHT gefolgt)| `path`                                                      |
-| count_entries      | Anzahl Dateien/Ordner zählen (max. 10000 rekursiv)| `path`, `recursive=False`                                     |
-| empty_directory    | Verzeichnis leeren (Option: Struktur behalten)    | `path`, `keep_structure=True`                                 |
-| move_directory     | Komplettes Verzeichnis verschieben                | `source`, `destination`                                       |
+### Kopieren, Verschieben & Links
 
-### Kopieren & Verschieben
+| Tool | Beschreibung | Parameter |
+|------|--------------|-----------|
+| `copy_file` | Datei kopieren | `source`, `destination` |
+| `copy_directory` | Verzeichnis rekursiv kopieren | `source`, `destination`, `preserve_times=True` |
+| `move_file` | Datei verschieben | `source`, `destination` |
+| `create_symlink` | Symbolischen Link erstellen | `path`, `target`, `is_directory=False` |
+| `resolve_symlink` | Symlink-Ziel auflösen | `path` |
+| `create_hardlink` | Hardlink erstellen | `path`, `target` |
 
-| Tool                | Beschreibung                                   | Parameter                                      |
-|---------------------|------------------------------------------------|------------------------------------------------|
-| copy_file           | Datei kopieren                                 | `source`, `destination`                        |
-| copy_directory      | Verzeichnis rekursiv kopieren                  | `source`, `destination`, `preserve_times=True` |
-| move_file           | Datei verschieben / umbenennen                 | `source`, `destination`                        |
-| create_hardlink     | Hardlink erstellen                             | `path`, `target`                               |
+### Archive & Suche
 
-### Archivoperationen (ZIP-Slip- und ZIP-Bomb-geschützt)
+| Tool | Beschreibung | Parameter |
+|------|--------------|-----------|
+| `compress_archive` | ZIP oder Tarball (`.tar.gz`, `.tgz`, `.tar.bz2`, `.tar.xz`) erstellen | `path`, `archive_path`, `compression="DEFLATED"` |
+| `decompress_archive` | ZIP/Tarball entpacken (ZIP-Slip-, Symlink- & Bomb-Schutz) | `archive_path`, `destination` |
+| `search_files` | Dateien per Glob-Muster suchen (max. 10 000 gescannt) | `path`, `pattern="*"`, `max_results=100`, `case_sensitive=False` |
+| `search_content` | Dateiinhalte durchsuchen (Regex, Dateien > 5 MB übersprungen) | `path`, `pattern`, `file_pattern="*"`, `max_results=50`, `context_lines=0` |
+| `get_recent_files` | Zuletzt geänderte Dateien finden | `path`, `max_results=20`, `time_range_days=7` |
 
-| Tool                 | Beschreibung                                                                   | Parameter                                         |
-|----------------------|--------------------------------------------------------------------------------|---------------------------------------------------|
-| compress_archive     | Archiv erstellen: ZIP oder Tarball (.tar.gz/.tgz/.tar.bz2/.tar.xz)             | `path`, `archive_path`, `compression="DEFLATED"` (nur ZIP)  |
-| decompress_archive   | ZIP/Tarball entpacken — mit Path-Traversal-, Symlink- und Bomb-Schutz           | `archive_path`, `destination`                     |
+### System & Status
 
-### Suche
+| Tool | Beschreibung | Parameter |
+|------|--------------|-----------|
+| `get_file_info` | Metadaten inkl. `symlink_target` und `realpath` | `path` |
+| `get_file_hash` | Hash berechnen (`md5`, `sha1`, `sha256`, `sha512`, max. 50 MB) | `path`, `algorithm="sha256"` |
+| `get_file_permissions` | Dateiberechtigungen lesen | `path` |
+| `chmod_file` | Berechtigungen setzen (max. `0o755`, kein setuid/setgid/world-writable) | `path`, `mode` |
+| `get_disk_usage` | Speicherplatz anzeigen | `path="."` |
+| `list_drives` | Laufwerke mit Kapazität auflisten | — |
+| `get_working_directory` | Arbeitsverzeichnis und System-Info | — |
+| `get_user_directories` | Benutzerordner (Desktop, Dokumente, …) | — |
+| `get_temp_directory` | Temp-Verzeichnis und Speicherbelegung | — |
+| `path_exists` | Existenz und Typ prüfen | `path` |
+| `get_allowed_roots` | Erlaubte Roots und blockierte Systempfade | — |
+| `get_server_status` | Server-Limits, Root-Konfiguration und Plattform-Info | — |
 
-| Tool             | Beschreibung                                            | Parameter                                                        |
-|------------------|---------------------------------------------------------|------------------------------------------------------------------|
-| search_files     | Dateien mit Glob-Muster suchen (max. 10000 gescannt)    | `path`, `pattern="*"`, `max_results=100`, `case_sensitive=False` |
-| search_content   | Dateiinhalte durchsuchen (grep-artig, Regex, cross-platform) | `path`, `pattern`, `file_pattern="*"`, `max_results=50`, `context_lines=0` |
-| get_recent_files | Zuletzt geänderte Dateien finden                        | `path`, `max_results=20`, `time_range_days=7`                    |
+## Internet-Recherche-Tools (`internet_recherche.py`, Port 8766)
 
-### Informationen
+Vollständige Dokumentation und Sicherheitsarchitektur: [`README_internet_recherche.md`](README_internet_recherche.md).
 
-| Tool                 | Beschreibung                                          | Parameter                     |
-|----------------------|-------------------------------------------------------|-------------------------------|
-| get_file_info        | Dateiinformationen (inkl. symlink_target + realpath)  | `path`                        |
-| get_disk_usage       | Festplattenauslastung anzeigen                        | `path="."`                    |
-| get_working_directory| Aktuelles Arbeitsverzeichnis und System-Info          | (keine)                       |
-| get_allowed_roots    | Konfigurierte Root-Pfade und blockierte Pfade         | (keine)                       |
-| get_file_hash        | Hash berechnen (MD5, SHA1, SHA256, SHA512), max. 50 MB | `path`, `algorithm="sha256"`  |
-| get_file_permissions | Dateiberechtigungen lesen (Unix-Modus)                | `path`                        |
-| chmod_file           | Berechtigungen ändern — restriktiv (max. 0o755)       | `path`, `mode`                |
-| list_drives          | Alle Laufwerke mit Kapazität anzeigen                 | (keine)                       |
-| get_user_directories | Benutzer-Ordner (Desktop, Dokumente, etc.)            | (keine)                       |
-| get_temp_directory   | Temp-Verzeichnis mit Speicherplatz-Analyse            | (keine)                       |
-| path_exists          | Pfadexistenz und Typ prüfen                           | `path`                        |
+| Tool | Beschreibung |
+|------|--------------|
+| `internet_research` | Kombinierte Suche über DuckDuckGo, Wikipedia, arXiv und GESTIS |
+| `internet_research_detailed` | Suche mit vollständigem Abruf der gefundenen Seiten |
+| `read_webpage` | Einzelne öffentliche URL sicher abrufen |
+| `safe_web_scrape` | Bereinigten Text einer Webseite mit Längenlimit extrahieren |
+| `search_wikipedia` | Wikipedia-Suche (`de` oder `en`) |
+| `search_arxiv` | Wissenschaftliche Paper auf arXiv suchen |
+| `search_gesti` | Gefahrstoffe in der DGUV GESTIS-Stoffdatenbank suchen (Name oder CAS-Nr.) |
+| `search_github` | Repositories/Code über `api.github.com` suchen |
+| `search_news` | Aktuelle Nachrichten über DuckDuckGo News |
+| `read_archived` | Archivierte Seitenfassung über die Wayback Machine abrufen |
+| `check_url_safety` | URL-Sicherheitsprüfung mit detaillierten Blockgründen (ohne HTTP-Request) |
+| `get_server_status` | Aktive Limits, Quellen und Rate-Limit-Restkontingent |
 
-### Symlinks
+## Sicherheit (Dateisystem-Server)
 
-| Tool             | Beschreibung                          | Parameter                              |
-|------------------|---------------------------------------|----------------------------------------|
-| create_symlink   | Symbolischen Link erstellen           | `path`, `target`, `is_directory=False` |
-| resolve_symlink  | Symlink auflösen und Ziel anzeigen    | `path`                                 |
+- **Pfad- & Symlink-Schutz**: `is_path_safe()` prüft sowohl den Eingabepfad als auch das aufgelöste `os.path.realpath()` gegen blockierte Systemverzeichnisse (u. a. `/etc/shadow`, `/etc/sudoers*`, `/etc/ssh`, `/sys`, `/dev`, `/root/.ssh`, `C:\Windows\System32\config`, `C:\Windows\System32\drivers`, `C:\$Recycle.Bin`) sowie Null-Bytes. `delete_file` folgt keinen Symlinks.
+- **Archiv-Schutz**: `decompress_archive` blockiert absolute Pfade, Drive-Letters, Path-Traversal (`../`), Symlinks im Archiv sowie ZIP-Bombs (> 10 000 Dateien, > 500 MB entpackt oder Kompressionsverhältnis > 100× bei > 10 MB).
+- **DoS- & Rechte-Limits**: 50 MB Datei-Limit, max. 10 000 rekursive Einträge (`truncated: true` bei Abbruch), `chmod_file` auf ≤ `0o755` beschränkt.
+- **Netzwerk & CORS**: Standard-Bind auf `127.0.0.1` (Warnung bei `0.0.0.0`/`::`), restriktive Localhost-CORS-Liste (`allow_credentials=False`).
 
-### Internet-Recherche (eigener Server!)
+### Umgebungsvariablen
 
-Die Internet-Recherche-Tools laufen auf einem **eigenen Server** (`internet_recherche.py`, Port 8766),
-**NICHT** auf dem Dateisystem-Server. Siehe [`README_internet_recherche.md`](README_internet_recherche.md)
-für die vollständige Doku und Sicherheitsfeatures.
+| Variable | Beschreibung | Default |
+|----------|--------------|---------|
+| `MCP_FILESYSTEM_ROOT` | Standard-Wurzelverzeichnis | Home-Verzeichnis |
+| `MCP_ALLOWED_ORIGINS` | Kommagetrennte erlaubte CORS-Origins (`*` nur lokal nutzen) | `http://127.0.0.1:8080,http://localhost:8080,http://127.0.0.1:8765,http://localhost:8765,http://127.0.0.1:8766,http://localhost:8766,http://127.0.0.1:1234,http://localhost:1234` |
 
-| Tool                       | Beschreibung                                     |
-|----------------------------|--------------------------------------------------|
-| internet_research          | Allgemeine Internetsuche (DuckDuckGo, Wikipedia) |
-| internet_research_detailed | Suche mit vollständigen Seiteninhalten           |
-| read_webpage               | Spezifische URL lesen                            |
-| search_wikipedia           | Spezialisierte Wikipedia-Suche                   |
-| search_arxiv               | Wissenschaftliche Paper suchen                   |
-| search_gesti               | Gefahrstoffdaten suchen                          |
-| safe_web_scrape            | Sicheres Scraping beliebiger Webseiten           |
-| `search_github`              | GitHub-Repositories/Code suchen (sicher)         |
-| `search_news`                | Aktuelle Nachrichten (DuckDuckGo News)           |
-| `read_archived`              | Archivierte Seite via Wayback Machine lesen      |
+### Bekannte Einschränkungen
 
-Start: `server_recherche.bat` oder `python internet_recherche.py --port 8766`.
-
-## Sicherheit
-
-Der Dateisystem-Server enthält die folgenden Härtungen gegenüber der Erstversion:
-
-### Kritische Schutzmaßnahmen
-
-- **Symlink-Ziel-Validierung** (`is_path_safe`): Jeder Pfad-Zugriff prüft nicht nur den eingegebenen Pfad, sondern auch das Symlink-Ziel (`os.path.realpath`). Ein Symlink namens `~/legit.txt → /etc/shadow` wird zuverlässig abgelehnt.
-- **ZIP-Slip-Schutz** in `decompress_archive`: Pro Eintrag werden absolute Pfade, Drive-Letters, Path-Traversal (`../`) und Symlinks im Archiv abgelehnt. Zusätzlich wird der normalisierte Zielpfad gegen das (real aufgelöste) Zielverzeichnis validiert.
-- **ZIP-Bomb-Schutz**: `decompress_archive` weist Archive ab mit:
-  - Mehr als 10 000 Dateien
-  - Mehr als 500 MB entpacktes Gesamtvolumen
-  - Kompressionsverhältnis > 100× bei > 10 MB unkomprimierter Größe
-- **Null-Byte-Schutz** in allen Pfad-Eingaben (`\x00` blockiert).
-
-### Hohe Priorität
-
-- **Eintrags-Limits für rekursive Operationen**: `list_directory`, `get_tree`, `count_entries`, `search_files`, `get_recent_files` und `get_temp_directory` brechen nach maximalen Eintragsmengen ab (DoS-Schutz). Antworten enthalten `truncated: true`, wenn das Limit erreicht wurde.
-- **Größenlimits**: `read_file`, `read_file_binary`, `write_file`, `write_file_binary`, `get_file_hash` und `get_file_lines` lehnen Dateien über 50 MB ab.
-- **Restriktives `chmod_file`**: Akzeptiert nur Modi ≤ 0o755 und blockiert `setuid`, `setgid` und world-writable Bits (kein 0o777, 0o666, 0o4xxx, 0o2xxx).
-- **CORS konfigurierbar** statt `*`: Standard ist jetzt eine kommagetrennte Liste von localhost-Origins; per Umgebungsvariable `MCP_ALLOWED_ORIGINS` änderbar.
-- **`delete_file` folgt keinen Symlinks**: Symlinks selbst werden gelöscht, nicht das Ziel.
-- **Erweiterte blockierte Pfade**: `/etc/sudoers.d`, `/etc/ssh`, `/sys`, `/dev`, `/root/.ssh`, `C:\Windows\System32\drivers`, `C:\$Recycle.Bin`, `C:\System Volume Information` u.a.
-- **Bind-Warnung**: Server warnt beim Start, wenn auf `0.0.0.0` oder `::` gebunden wird.
-
-### Konfiguration
-
-Umgebungsvariablen:
-
-| Variable                | Beschreibung                           | Default             |
-|-------------------------|----------------------------------------|--------------------------------|
-| `MCP_FILESYSTEM_ROOT`   | Startverzeichnis                       | Home-Verzeichnis    |
-| `MCP_ALLOWED_ORIGINS`   | Kommagetrennte CORS-Origins. `*` erlaubt alle (NUR für reines Localhost!) | `http://127.0.0.1:8080,http://localhost:8080,http://127.0.0.1:8765,http://localhost:8765`|
-
-Beispiel für Produktion:
-
-```bash
-set MCP_ALLOWED_ORIGINS=http://127.0.0.1:8080
-python lokales_dateisystem.py --host 127.0.0.1 --port 8765
-```
-
-### Bekannte Einschränkungen / nicht behoben
-
-- **TOCTOU-Race**: Zwischen `is_path_safe` und der eigentlichen Datei-Operation könnte ein lokaler Angreifer theoretisch einen Symlink unterschieben. Auf Single-User-Systemen (typischer llama.cpp-Use-Case) ist das kein realistisches Risiko; Mitigation per File-Descriptor-basierter API (`openat`) wurde wegen Portabilitäts-Verlust nicht umgesetzt.
-- **Keine eingebaute Authentifizierung**: Beide MCP-Server haben keine Auth-Schicht; das ist im aktuellen MCP-Protokoll auch nicht standardisiert. Schutz erfolgt ausschließlich über das Binding auf `127.0.0.1` (Default) und CORS.
-- **chmod_file mit max. 0o755**: Wer 0o775 (Gruppe schreiben) oder 0o770 benötigt, kommt mit dieser Restriktion nicht durch. Begründung: Risiko durch LLM-Fehlsteuerung höher als Nutzen.
+- **Keine eingebaute Authentifizierung**: Zugriffsschutz erfolgt über das lokale Binding (`127.0.0.1`) und CORS. Server nicht ungeschützt ins Netzwerk exponieren.
+- **TOCTOU bei Dateisystemzugriffen**: Auf Mehrbenutzersystemen existiert theoretisch ein Zeitfenster zwischen Pfadprüfung und Dateioperation (Single-User-Design).
+- **UTF-8 unter Windows**: Bei Umlautproblemen im Terminal `PYTHONUTF8=1` und `PYTHONIOENCODING=utf-8` setzen.
 
 ## Transport-Modi
 
-| Modus              | Beschreibung                           |
-|--------------------|----------------------------------------|
-| streamable-http    | HTTP-Transport (empfohlen für WebUI)   |
-| sse                | Server-Sent Events                     |
-| stdio              | Standard-Ein/Ausgabe (lokale Nutzung)  |
-
-## Hinweis
-
-Der Server nutzt UTF-8-Codierung für Eingabe/Ausgabe. Bei Problemen mit Umlauten bitte sicherstellen, dass die Umgebungsvariablen `PYTHONUTF8=1` und `PYTHONIOENCODING=utf-8` gesetzt sind.
-
-## Beispiel-URLs
-
-```
-Dateisystem-Server:   http://127.0.0.1:8765/mcp
-Internet-Recherche:    http://127.0.0.1:8766/mcp
-```
+`--transport` unterstützt `streamable-http` (Standard für llama.cpp WebUI), `sse` und `stdio`.

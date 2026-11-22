@@ -43,7 +43,7 @@ python -m pip install --upgrade pip >nul 2>&1
 if exist "requirements-recherche.txt" (
     python -m pip install -r requirements-recherche.txt
 ) else (
-    python -m pip install "mcp[cli]==1.29.0" uvicorn starlette httpx duckduckgo-search beautifulsoup4
+    python -m pip install "mcp[cli]==1.29.0" uvicorn starlette httpx ddgs beautifulsoup4
 )
 if errorlevel 1 (
     echo.
@@ -55,7 +55,6 @@ if errorlevel 1 (
 echo.
 echo ========================================
 echo   Recherche-Server wird gestartet
-echo   Erlaubt: DuckDuckGo, Wikipedia, arXiv, GESTI
 echo   STRG+C zum Beenden
 echo ========================================
 echo.

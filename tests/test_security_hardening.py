@@ -33,6 +33,9 @@ class TestDecodeIpHostname:
             ("2130706433", "127.0.0.1"),      # dezimal -> loopback
             ("0x7f000001", "127.0.0.1"),      # hex     -> loopback
             ("0177.0.0.1", "127.0.0.1"),      # oktal-dotted -> loopback
+            ("0177.0.0", "127.0.0.0"),        # 3-Teil oktal shorthand (POSIX inet_aton)
+            ("127.1", "127.0.0.1"),           # 2-Teil shorthand
+            ("0x7f.0.0.1", "127.0.0.1"),      # hex-dotted
             ("3232235521", "192.168.0.1"),    # dezimal -> private
             ("2852039166", "169.254.169.254"),# dezimal -> AWS metadata (link-local)
         ],
@@ -45,7 +48,8 @@ class TestDecodeIpHostname:
         [
             "8.8.8.8",            # dotted-dezimal (kein Encoding) -> None
             "example.com",
-            "0177.0.0",           # kein 4-Oktett
+            "0177.0.0.999",       # Oktett ausserhalb Bereich
+            "1.2.3.4.5",          # > 4 Teile
             "0xZZZZ",             # kein gueltiges Hex
             "4294967296",         # > 32-bit Bereich
         ],
